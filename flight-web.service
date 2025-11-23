@@ -1,0 +1,14 @@
+[Unit]
+Description=Flight-Pi Web Server
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/pi/flight-display/web_server.py
+WorkingDirectory=/home/pi/flight-display
+StandardOutput=inherit
+StandardError=inherit
+Restart=always
+User=pi
+
+[Install]
+WantedBy=multi-user.target

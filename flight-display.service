@@ -1,0 +1,16 @@
+[Unit]
+Description=Nearest Flight Display
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/flight-display
+# give network a couple extra seconds just in case Wi-Fi is slow
+ExecStartPre=/bin/sleep 5
+ExecStart=/usr/bin/python3 /home/pi/flight-display/flight.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
