@@ -3,12 +3,15 @@
 
 import os
 import sqlite3
+import json
+import time
 from flask import (
     Flask,
     jsonify,
     render_template_string,
     request,
     send_from_directory,
+    Response,
 )
 from flight_logger import DB_PATH
 
@@ -299,6 +302,34 @@ def api_stats():
 
 
 # ---------------------------------------------------
+# Server-Sent Events: push the most-recent flight when it changes
+# ---------------------------------------------------
+@app.route("/events")
+def sse_events():
+    def gen():
+        last_id = None
+        while True:
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                conn.row_factory = sqlite3.Row
+                c = conn.cursor()
+                c.execute("SELECT * FROM flights ORDER BY id DESC LIMIT 1")
+                row = c.fetchone()
+                conn.close()
+                if row:
+                    rowd = dict(row)
+                    rid = rowd.get("id")
+                    if rid != last_id:
+                        last_id = rid
+                        # send JSON payload (use default=str for datetimes)
+                        yield f"data: {json.dumps(rowd, default=str)}\n\n"
+            except Exception:
+                # keep loop alive on error
+                pass
+            time.sleep(2)
+    return Response(gen(), mimetype="text/event-stream")
+
+# ---------------------------------------------------
 # MAIN UI (Dashboard)
 # ---------------------------------------------------
 HTML_MAIN = """
@@ -452,6 +483,25 @@ HTML_MAIN = """
             0% { box-shadow: 0 0 0 0 rgba(255,111,0,0.4); }
             70% { box-shadow: 0 0 0 10px rgba(255,111,0,0); }
             100% { box-shadow: 0 0 0 0 rgba(255,111,0,0); }
+        }
+
+        /* micro-animation when a new latest arrives */
+        .latest-animate {
+            animation: topGlow 900ms ease-out;
+        }
+        @keyframes topGlow {
+            0% { box-shadow: 0 0 0 0 rgba(255,111,0,0.0); transform: translateY(0); }
+            40% { box-shadow: 0 12px 32px rgba(255,111,0,0.18); transform: translateY(-8px); }
+            100% { box-shadow: 0 0 0 0 rgba(255,111,0,0.0); transform: translateY(0); }
+        }
+
+        .badge-pulse {
+            animation: badgePop 700ms ease-out;
+        }
+        @keyframes badgePop {
+            0% { transform: scale(0.92); opacity: 0.95; }
+            50% { transform: scale(1.14); opacity: 1; }
+            100% { transform: scale(1); opacity: 1; }
         }
 
         .card-header-line {
@@ -883,6 +933,55 @@ HTML_MAIN = """
             loadFlights();
             loadStats();
         };
+
+        /* Real-time EventSource subscription: insert new latest and trigger micro-animation */
+        if (window.EventSource) {
+            try {
+                const es = new EventSource('/events');
+                es.onmessage = e => {
+                    try {
+                        const row = JSON.parse(e.data);
+                        // Deduplicate: remove same id if already in list
+                        flightsData = flightsData.filter(r => r.id !== row.id);
+                        // Insert at front
+                        flightsData.unshift(row);
+                        // keep limit
+                        flightsData = flightsData.slice(0, 50);
+                        renderFlights();
+
+                        // trigger micro-animation on top card
+                        const container = document.getElementById('cards');
+                        const top = container.querySelector('.card'); // after render, first .card is top
+                        if (top) {
+                            // add animate class
+                            top.classList.remove('latest-animate');
+                            // force reflow to restart animation
+                            void top.offsetWidth;
+                            top.classList.add('latest-animate');
+
+                            // pulse the badge if present
+                            const badge = top.querySelector('.latest-badge');
+                            if (badge) {
+                                badge.classList.remove('badge-pulse');
+                                void badge.offsetWidth;
+                                badge.classList.add('badge-pulse');
+                                // remove pulse class after animation completes
+                                setTimeout(() => badge.classList.remove('badge-pulse'), 900);
+                            }
+                            // remove animate class after animation completes
+                            setTimeout(() => top.classList.remove('latest-animate'), 1000);
+                        }
+                    } catch (err) {
+                        // ignore malformed events
+                    }
+                };
+                es.onerror = () => {
+                    // no-op; browser will retry automatically
+                };
+            } catch (err) {
+                // EventSource not available or failed to open
+            }
+        }
     </script>
 
 </head>
