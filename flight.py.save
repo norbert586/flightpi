@@ -1,0 +1,259 @@
+#!/usr/bin/python3
+# -*- coding: UTF-8 -*-
+
+import time, math, requests
+from PIL import Image, ImageDraw, ImageFont
+from lib import LCD_2inch  # your local Waveshare driver
+
+# ---------- CONFIG ----------
+ME_LAT = 42.7077
+ME_LON = -83.0315
+RADIUS_NM = 50
+TIMEOUT_S = 10
+REFRESH_S = 12
+ROTATE_DEG = 180   # match your working demo
+
+# Colors (FR24-ish dark header, light body)
+COL_BG = (20, 22,COL_ERROR = (128, 0, 0)      # error background
+
+# ---------- FONT ----------
+def load_fonts():
+    try:
+        f_lg = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 26)
+        f_md = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
+        f_sm = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
+    except Exception:
+        f_lg = ImageFont.load_default()
+        f_md = ImageFont.load_default()
+        f_sm = ImageFont.load_default()
+    return f_lg, f_md, f_sm
+
+F_LG, F_MD, F_SM = load_fonts()
+
+# ---------- UTILS ----------
+def tb(draw, text, font):
+    """text bbox -> width, height"""
+    bbox = draw.textbbox((0,0), text, font=font)
+    return bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+def center_x(draw, text, font, width):
+    w, _ = tb(draw, text, font)
+    return (width - w) // 2
+
+def haversine_nm(lat1, lon1, lat2, lon2):
+    R_km = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1))*math.cos(math.radians(lat2))*math.sin(dlon/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    km = R_km * c
+    return km * 0.539957
+
+def fmt_int(n):
+    try:
+        return f"{int(round(float(n))):,}"
+    except Exception:
+        return "—"
+
+def pick(obj, *keys, default="—"):
+    for k in keys:
+        v = obj.get(k)
+        if v is not None and v != "":
+            return v
+    return default
+
+def parse_response(data):
+    """
+    Accept either:
+      - single aircraft object (preferred for /closest), or
+      - {"ac": [ ... ]} like the sample you provided
+    Returns aircraft dict or None.
+    """
+    if isinstance(data, dict) and "ac" in data and isinstance(data["ac"], list) and data["ac"]:
+        return data["ac"][0]
+    if isinstance(data, dict) and data.get("lat") is not None and data.get("lon") is not None:
+        return data
+    return None
+
+# ---------- DRAWING ----------
+def draw_loading(disp, tick=0):
+    W, H = disp.height, disp.width
+    img = Image.new("RGB", (W, H), COL_BG)
+    d = ImageDraw.Draw(img)
+
+    title = "Loading flight-pi"
+    x = center_x(d, title, F_LG, W)
+    d.text((x, 40), title, font=F_LG, fill=COL_TEXT)
+
+    # simple spinner (arc) below the text
+    cx, cy, r = W//2, 110, 20
+    start = (tick * 18) % 360
+    d.arc([cx-r, cy-r, cx+r, cy+r], start=start, end=start+270, fill=COL_ACCENT, width=3)
+
+    img = img.rotate(ROTATE_DEG)
+    disp.ShowImage(img)
+
+def draw_error(disp, msg):
+    W, H = disp.height, disp.width
+    img = Image.new("RGB", (W, H), COL_ERROR)
+    d = ImageDraw.Draw(img)
+    txt = "Error"
+    x = center_x(d, txt, F_LG, W); d.text((x, 40), txt, font=F_LG, fill=COL_TEXT)
+    y = 80
+    for line in (msg[:28], time.strftime("%I:%M:%S %p")):
+        x = center_x(d, line, F_MD, W)
+        d.text((x, y), line, font=F_MD, fill=COL_TEXT); y += 22
+    img = img.rotate(ROTATE_DEG)
+    disp.ShowImage(img)
+
+def draw_card(disp, ac):
+    """
+    Paint an FR24-like card.
+    """
+    W, H = disp.height, disp.width  # 240 x 320 in portrait
+    img = Image.new("RGB", (W, H), COL_BG)
+    d = ImageDraw.Draw(img)
+
+    # Card container
+    margin = 8
+    card = [margin, margin, W - margin, H - margin]
+    d.rounded_rectangle(card, radius=10, fill=COL_CARD)
+
+    # Header bar
+    hdr_h = 50
+    hdr = [card[0], card[1], card[2], card[1] + hdr_h]
+    d.rounded_rectangle(hdr, radius=10, fill=COL_HDR)
+    # Header text
+    callsign = pick(ac, "flight", "call", default="Unknown").strip()
+    type_tag = pick(ac, "t", "type", default="—")
+    # Callsign left, big
+    d.text((card[0] + 12, card[1] + 12), callsign, font=F_LG, fill=COL_TEXT)
+    # Type tag on right, small pill
+    tag_txt = type_tag
+    tw, th = tb(d, tag_txt, F_SM)
+    tag_pad = 6
+    tag_box = [card[2]-tw-2*tag_pad-12, card[1] + (hdr_h-th)//2 - 4,
+               card[2]-12, card[1] + (hdr_h-th)//2 + th + 4]
+    d.rounded_rectangle(tag_box, radius=8, fill=COL_ACCENT)
+    d.text((tag_box[0]+tag_pad, tag_box[1]+4), tag_txt, font=F_SM, fill=(0,0,0))
+
+    # Body grid (two rows)
+    y0 = hdr[3] + 8
+
+    # Distance (use dst if present else compute)
+    if ac.get("dst") is not None:
+        d_nm = float(ac["dst"])
+    else:
+        if ac.get("lat") is not None and ac.get("lon") is not None:
+            d_nm = haversine_nm(ME_LAT, ME_LON, ac["lat"], ac["lon"])
+        else:
+            d_nm = float("nan")
+    dist_txt = f"{d_nm:.1f} NM" if d_nm == d_nm else "—"
+
+    alt_txt = f"{fmt_int(pick(ac, 'alt_baro', 'alt_geom', 'alt'))} ft"
+    spd_txt = f"{fmt_int(pick(ac, 'gs', 'speed'))} kt"
+    hdg_val = pick(ac, "track", "trak", default="—")
+    try:
+        hdg_int = int(round(float(hdg_val)))
+        hdg_txt = f"{hdg_int}°"
+    except Exception:
+        hdg_int = None
+        hdg_txt = "—"
+    reg_txt = pick(ac, "r", default="—")
+
+    # Row 1: Distance | Altitude
+    col_w = (card[2] - card[0] - 24) // 2
+    x1 = card[0] + 12
+    x2 = x1 + col_w + 12
+    y = y0
+
+    # Distance
+    d.text((x1, y), "DISTANCE", font=F_SM, fill=COL_MUTED); y += 18
+    d.text((x1, y), dist_txt, font=F_MD, fill=COL_TEXT)
+    # Altitude
+    y = y0
+    d.text((x2, y), "ALTITUDE", font=F_SM, fill=COL_MUTED); y += 18
+    d.text((x2, y), alt_txt, font=F_MD, fill=COL_TEXT)
+
+    # Row 2: Speed | Heading (+ arrow)
+    y = y0 + 52
+    d.text((x1, y), "SPEED", font=F_SM, fill=COL_MUTED); y += 18
+    d.text((x1, y), spd_txt, font=F_MD, fill=COL_TEXT)
+    # Heading
+    y = y0 + 52
+    d.text((x2, y), "HEADING", font=F_SM, fill=COL_MUTED); y += 18
+    d.text((x2, y), hdg_txt, font=F_MD, fill=COL_TEXT)
+    # Tiny arrow to show bearing
+    if hdg_int is not None:
+        # draw a small triangle arrow pointing hdg_int degrees
+        ax, ay = x2 + 90, y - 2
+        L = 10
+        # Simple line arrow
+        theta = math.radians(hdg_int - 90)  # rotate so 0° is up visually
+        x_end = ax + int(L * math.cos(theta))
+        y_end = ay + int(L * math.sin(theta))
+        d.line([(ax, ay), (x_end, y_end)], fill=COL_ACCENT, width=3)
+        # a tiny head
+        d.ellipse([x_end-2, y_end-2, x_end+2, y_end+2], fill=COL_ACCENT)
+
+    # Footer: Reg + updated time (centered)
+    foot = time.strftime("Updated %I:%M:%S %p").lstrip("0")
+    footer_txt = f"Reg: {reg_txt}   {foot}"
+    fw, _ = tb(d, footer_txt, F_SM)
+    d.text((card[0] + (card[2]-card[0]-fw)//2, card[3]-24), footer_txt, font=F_SM, fill=COL_MUTED)
+
+    img = img.rotate(ROTATE_DEG)
+    disp.ShowImage(img)
+
+# ---------- MAIN ----------
+def main():
+    disp = LCD_2inch.LCD_2inch()
+    disp.Init()
+    disp.clear()
+    try:
+        disp.bl_DutyCycle(80)  # brighten a bit
+    except Exception:
+        pass
+
+    # Splash
+    for tick in range(6):  # ~2 seconds of spinner
+        draw_loading(disp, tick)
+        time.sleep(0.33)
+
+    while True:
+        try:
+            url = f"https://api.adsb.lol/v2/closest/{ME_LAT}/{ME_LON}/{RADIUS_NM}"
+            resp = requests.get(url, timeout=TIMEOUT_S)
+            resp.raise_for_status()
+            data = resp.json()
+            ac = parse_response(data)
+
+            if not ac:
+                # No aircraft returned
+                img = Image.new("RGB", (disp.height, disp.width), COL_CARD)
+                d = ImageDraw.Draw(img)
+                msg = "No aircraft nearby"
+                x = center_x(d, msg, F_MD, disp.height)
+                d.text((x, 60), msg, font=F_MD, fill=COL_TEXT)
+                t = time.strftime("%I:%M:%S %p").lstrip("0")
+                x = center_x(d, t, F_SM, disp.height)
+                d.text((x, 84), t, font=F_SM, fill=COL_MUTED)
+                img = img.rotate(ROTATE_DEG)
+                disp.ShowImage(img)
+            else:
+                draw_card(disp, ac)
+
+        except Exception as e:
+            draw_error(disp, str(e)[:28])
+
+        time.sleep(REFRESH_S)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        # best-effort cleanup
+        try:
+            LCD_2inch.module_exit()
+        except Exception:
+            pass
