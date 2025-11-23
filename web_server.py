@@ -45,7 +45,7 @@ def plane_image(hex_code):
 # ---------------------------------------------------
 # DB Helpers
 # ---------------------------------------------------
-def get_recent_flights(limit=50):
+def get_recent_flights(limit=150):
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     try:
@@ -946,7 +946,7 @@ HTML_MAIN = """
                         // Insert at front
                         flightsData.unshift(row);
                         // keep limit
-                        flightsData = flightsData.slice(0, 50);
+                        flightsData = flightsData.slice(0, 150);
                         renderFlights();
 
                         // trigger micro-animation on top card
