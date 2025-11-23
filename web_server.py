@@ -412,9 +412,46 @@ HTML_MAIN = """
             padding: 12px 14px;
             margin-bottom: 12px;
             cursor: pointer;
+            position: relative; /* allow absolute badge to position inside card without overlapping content */
         }
         .card:hover {
             border-color: #2a3540;
+        }
+
+        /* Highlight for the top / most-recent card */
+        .latest-record {
+            border-left: 4px solid #ff6f00;
+            background: linear-gradient(180deg, rgba(255,111,0,0.04), transparent);
+            box-shadow: 0 6px 18px rgba(0,0,0,0.08);
+            transform: translateY(-2px);
+            transition: transform 200ms ease, box-shadow 200ms ease;
+            position: relative;
+            padding-left: 12px;
+        }
+        /* prevent the latest badge overlapping the right-side tag by adding right spacing to the tag */
+        .latest-record .tag {
+            margin-right: 92px;
+        }
+        .latest-record:hover { transform: translateY(-4px); box-shadow: 0 10px 24px rgba(0,0,0,0.12); }
+
+        .latest-badge {
+            position: absolute;
+            right: 12px;
+            top: 12px;
+            background: #ff6f00;
+            color: #fff;
+            font-weight: 700;
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.12);
+            animation: pulse 2000ms infinite;
+        }
+
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(255,111,0,0.4); }
+            70% { box-shadow: 0 0 0 10px rgba(255,111,0,0); }
+            100% { box-shadow: 0 0 0 0 rgba(255,111,0,0); }
         }
 
         .card-header-line {
@@ -628,9 +665,10 @@ HTML_MAIN = """
 
             const flights = applyFilterAndSort();
 
-            flights.forEach(f => {
+            flights.forEach((f, idx) => {
                 const card = document.createElement("div");
-                card.className = "card";
+                const isTop = idx === 0;
+                card.className = "card" + (isTop ? " latest-record" : "");
                 card.dataset.reg = f.reg || "";
                 card.dataset.hex = f.hex || "";
                 card.dataset.callsign = f.callsign || "";
@@ -676,6 +714,7 @@ HTML_MAIN = """
                 const tagLabel = classifyTag(f);
 
                 card.innerHTML = `
+                    ${isTop ? `<span class="latest-badge">LATEST</span>` : ""}
                     <div class="card-header-line">
                         <div class="callsign">${f.callsign || "UNKNOWN"}</div>
                         <div class="reg">${f.reg || "—"}</div>
