@@ -14,6 +14,8 @@ from flask import (
     Response,
 )
 from flight_logger import DB_PATH
+from mil_fetcher import MIL_DB
+
 
 app = Flask(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -143,6 +145,27 @@ def get_flight_detail(reg: str, hex_code: str):
         return detail
     finally:
         conn.close()
+
+
+def get_recent_mil(limit=200):
+    conn = sqlite3.connect(MIL_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT hex, flight, type, alt_baro, squawk, rr_lat, rr_lon, seen
+            FROM mil
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = c.fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
 
 
 def get_stats():
@@ -284,6 +307,11 @@ def get_stats():
 def api_flights():
     limit = int(request.args.get("limit", 50))
     return jsonify(get_recent_flights(limit))
+
+
+@app.route("/api/mil")
+def api_mil():
+    return jsonify(get_recent_mil())
 
 
 @app.route("/api/flight_detail")
@@ -1308,6 +1336,104 @@ HTML_STATS = """
 </body>
 </html>
 """
+# ---------------------------------------------------
+# /mil page
+# ---------------------------------------------------
+HTML_MIL = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Flight-Pi — Military Surveillance</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body {
+            background: #0b0e11;
+            color: #d0d3d6;
+            font-family: "Segoe UI", Roboto, Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+        }
+        header {
+            background: #101417;
+            padding: 12px 16px;
+            border-bottom: 1px solid #1c2329;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .title {
+            font-size: 18px;
+            font-weight: 600;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+        }
+        .back-link {
+            font-size: 14px;
+        }
+        .container {
+            padding: 12px 14px;
+        }
+        .row {
+            border-bottom: 1px solid #1c2228;
+            padding: 6px 2px;
+            font-size: 14px;
+        }
+        .row:last-child {
+            border-bottom: none;
+        }
+        .label {
+            color: #70818a;
+            font-size: 11px;
+            text-transform: uppercase;
+            margin-right: 4px;
+        }
+    </style>
+    <script>
+        function parseAgo(seen) {
+            if (!seen) return "?";
+            if (typeof seen !== "number") return "?";
+            if (seen < 60) return seen + " sec ago";
+            return (Math.round(seen/60)) + " min ago";
+        }
+
+        async function loadMIL() {
+            const res = await fetch('/api/mil');
+            const data = await res.json();
+            const box = document.getElementById("milRows");
+
+            box.innerHTML = "";
+            data.forEach(m => {
+                const row = document.createElement("div");
+                row.className = "row";
+                row.innerHTML = `
+                    <span class="label">${m.type || "?"}</span>
+                    ${m.flight || "UNKNOWN"}<br>
+                    <span style="color:#42f5d7;">${m.hex}</span> ·
+                    Alt ${m.alt_baro || "?"} ft ·
+                    Seen ${parseAgo(m.seen)}
+                `;
+                box.appendChild(row);
+            });
+        }
+
+        window.onload = () => loadMIL();
+        setInterval(loadMIL, 10000);
+    </script>
+</head>
+<body>
+
+<header>
+    <div class="title">MIL-AIR OPS</div>
+    <div class="back-link"><a href="/">← Back</a></div>
+</header>
+
+<div class="container">
+    <div id="milRows">Loading…</div>
+</div>
+
+</body>
+</html>
+"""
 
 
 @app.route("/")
@@ -1318,6 +1444,10 @@ def index():
 @app.route("/stats")
 def stats_page():
     return render_template_string(HTML_STATS)
+
+@app.route("/mil")
+def mil_page():
+    return render_template_string(HTML_MIL)
 
 
 if __name__ == "__main__":
