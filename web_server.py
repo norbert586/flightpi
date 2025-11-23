@@ -23,6 +23,21 @@ def favicon():
     # Put your icon as favicon.png in /home/pi/flight-display
     return send_from_directory(BASE_DIR, "favicon.png", mimetype="image/png")
 
+# ---------------------------------------------------
+# Plane image endpoint
+# ---------------------------------------------------
+@app.route("/planeimg/<hex_code>")
+def plane_image(hex_code):
+    hex_code = hex_code.strip().upper()
+    photo_dir = os.path.join(BASE_DIR, "cache", "photos")
+    photo_path = os.path.join(photo_dir, f"{hex_code}.jpg")
+
+    if os.path.exists(photo_path):
+        return send_from_directory(photo_dir, f"{hex_code}.jpg")
+
+    # We return a 1x1 transparent pixel and let CSS handle
+    return send_from_directory(BASE_DIR, "blank.png", mimetype="image/png")
+
 
 # ---------------------------------------------------
 # DB Helpers
@@ -789,6 +804,12 @@ HTML_MAIN = """
             const countryIso = (f.country_iso || "").trim();
             const flagUrl = countryFlagUrl(countryIso);
 
+            let imgTag = `<img src="/planeimg/${f.hex}" class="plane-img-box">`;
+
+            if (!f.hex) {
+                imgTag = `<div class="plane-img-box">NO IMAGE AVAILABLE</div>`;
+            }
+
             body.innerHTML = `
                 <div class="modal-row"><span class="label">Callsign</span>${f.callsign || "UNKNOWN"}</div>
                 <div class="modal-row"><span class="label">Registration</span>${f.reg || "—"}</div>
@@ -801,7 +822,12 @@ HTML_MAIN = """
                 <div class="modal-row"><span class="label">Times seen</span>${f.total_seen}</div>
                 <div class="modal-row"><span class="label">First seen</span>${firstText}</div>
                 <div class="modal-row"><span class="label">Last seen</span>${lastText}</div>
+
+                <div style="margin-top:12px; text-align:center;">
+                    ${imgTag}
+                </div>
             `;
+
         }
 
         function closeModal() {
@@ -922,6 +948,22 @@ HTML_STATS = """
 
         .container {
             padding: 14px 14px 20px 14px;
+        }
+
+        .plane-img-box {
+            width: 260px;
+            height: 160px;
+            border-radius: 6px;
+            border: 1px solid #2a3138;
+            background: linear-gradient(135deg, #2e363d, #1e252b);
+            object-fit: cover;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #b8c2ca;
+            font-size: 13px;
+            font-weight: 500;
+            text-align: center;
         }
 
         .section {
