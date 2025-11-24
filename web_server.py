@@ -14,6 +14,7 @@ from flask import (
     Response,
 )
 from flight_logger import DB_PATH
+import requests
 
 app = Flask(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -299,6 +300,20 @@ def api_flight_detail():
 @app.route("/api/stats")
 def api_stats():
     return jsonify(get_stats())
+
+@app.route("/api/mil")
+def api_mil():
+    try:
+        r = requests.get("https://api.adsb.lol/v2/mil", timeout=10)
+        if r.status_code != 200:
+            return jsonify({"error": "bad_status", "status": r.status_code}), 500
+        data = r.json()
+
+        # data["ac"] is the aircraft list
+        return jsonify(data.get("ac", []))
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ---------------------------------------------------
@@ -1309,6 +1324,122 @@ HTML_STATS = """
 </html>
 """
 
+# ---------------------------------------------------
+# /mil page
+# ---------------------------------------------------
+HTML_MIL = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Military Aircraft Monitor</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <link rel="icon" href="/favicon.ico" type="image/png">
+
+
+    <style>
+        body {
+            background: #0b0e11;
+            color: #d0d3d6;
+            font-family: "Segoe UI", Roboto, Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+        }
+        header {
+            background: #101417;
+            padding: 12px 16px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #1c2329;
+        }
+        .title {
+            font-size: 20px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .back-link a {
+            color: #42f5d7;
+            text-decoration: none;
+        }
+        .container {
+            padding: 12px;
+        }
+        .mil-card {
+            background: #14181d;
+            border: 1px solid #1f242a;
+            padding: 10px;
+            border-radius: 6px;
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+        .callsign {
+            font-size: 17px;
+            font-weight: 600;
+            color: #e6f5ec;
+        }
+        .row {
+            font-size: 13px;
+            margin-top: 4px;
+        }
+    </style>
+
+
+    <script>
+        async function loadMIL() {
+            const con = document.getElementById("milbox");
+            con.innerHTML = "<div>Loading...</div>";
+
+            const res = await fetch('/api/mil');
+            if (!res.ok) {
+                con.innerHTML = "<div>Error loading military data</div>";
+                return;
+            }
+
+            const aircraft = await res.json();
+
+            if (!aircraft.length) {
+                con.innerHTML = "<div>No military aircraft detected.</div>";
+                return;
+            }
+
+            con.innerHTML = "<div style='margin-bottom:8px; color:#8ab;'>Detected: <b>" +
+                aircraft.length +
+                "</b> military aircraft</div>";
+
+            aircraft.forEach(ac => {
+                const el = document.createElement("div");
+                el.className = "mil-card";
+                el.innerHTML = `
+                    <div class="callsign">${ac.flight || "UNKNOWN"}</div>
+                    <div class="row"><b>HEX:</b> ${ac.hex}</div>
+                    <div class="row"><b>Type:</b> ${ac.t || ac.type || "N/A"}</div>
+                    <div class="row"><b>Altitude:</b> ${ac.alt_baro || "??"} ft</div>
+                    <div class="row"><b>Category:</b> ${ac.category || "??"}</div>
+                    <div class="row"><b>Messages:</b> ${ac.messages || "??"}</div>
+                `;
+                con.appendChild(el);
+            });
+        }
+
+        window.onload = loadMIL;
+    </script>
+
+</head>
+<body>
+
+<header>
+    <div class="title">MIL Aircraft</div>
+    <div class="back-link"><a href="/">← Back</a></div>
+</header>
+
+<div class="container" id="milbox"></div>
+
+</body>
+</html>
+"""
+
+
 
 @app.route("/")
 def index():
@@ -1318,6 +1449,11 @@ def index():
 @app.route("/stats")
 def stats_page():
     return render_template_string(HTML_STATS)
+
+@app.route("/mil")
+def mil_page():
+    return render_template_string(HTML_MIL)
+
 
 
 if __name__ == "__main__":
