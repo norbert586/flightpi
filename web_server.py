@@ -307,10 +307,37 @@ def api_mil():
         r = requests.get("https://api.adsb.lol/v2/mil", timeout=10)
         if r.status_code != 200:
             return jsonify({"error": "bad_status", "status": r.status_code}), 500
-        data = r.json()
+        raw = r.json().get("ac", [])
 
-        # data["ac"] is the aircraft list
-        return jsonify(data.get("ac", []))
+        enriched = []
+        for ac in raw:
+            hexcode = ac.get("hex", "").strip().upper()
+            info = {}
+
+            if hexcode:
+                try:
+                    r2 = requests.get(
+                        f"https://api.adsbdb.com/v0/aircraft/{hexcode}",
+                        timeout=6
+                    )
+                    if r2.status_code == 200:
+                        j = r2.json()
+                        ad = j.get("response", {}).get("aircraft", {})
+                        info = {
+                            "db_type": ad.get("type"),
+                            "db_icao": ad.get("icao_type"),
+                            "db_manufacturer": ad.get("manufacturer"),
+                            "db_owner": ad.get("registered_owner"),
+                            "db_country": ad.get("registered_owner_country_name"),
+                        }
+                except:
+                    pass
+
+            merged = ac.copy()
+            merged.update(info)
+            enriched.append(merged)
+
+        return jsonify(enriched)
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1334,56 +1361,74 @@ HTML_MIL = """
     <title>Military Aircraft Monitor</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
 
-    <link rel="icon" href="/favicon.ico" type="image/png">
-
-
     <style>
         body {
-            background: #0b0e11;
-            color: #d0d3d6;
-            font-family: "Segoe UI", Roboto, Arial, sans-serif;
+            background: #070708;
+            color: #e6e6e6;
+            font-family: "Consolas", monospace;
             margin: 0;
             padding: 0;
         }
         header {
-            background: #101417;
+            background: #120000;
             padding: 12px 16px;
             display: flex;
             justify-content: space-between;
             align-items: center;
-            border-bottom: 1px solid #1c2329;
+            border-bottom: 2px solid #ff0000;
         }
         .title {
             font-size: 20px;
-            font-weight: 600;
+            font-weight: 800;
+            color: #ff4d4d;
+            letter-spacing: 1px;
             text-transform: uppercase;
         }
         .back-link a {
-            color: #42f5d7;
+            color: #ff6961;
             text-decoration: none;
         }
         .container {
             padding: 12px;
         }
         .mil-card {
-            background: #14181d;
-            border: 1px solid #1f242a;
-            padding: 10px;
+            background: #0e0e10;
+            border: 1px solid #2a0000;
+            padding: 12px;
             border-radius: 6px;
-            margin-bottom: 8px;
+            margin-bottom: 10px;
             font-size: 14px;
+            box-shadow: 0 0 8px #2d0000;
         }
         .callsign {
-            font-size: 17px;
-            font-weight: 600;
-            color: #e6f5ec;
+            font-size: 19px;
+            font-weight: 700;
+            color: #ff4d4d;
         }
         .row {
-            font-size: 13px;
-            margin-top: 4px;
+            font-size: 12px;
+            margin-top: 6px;
+            color: #cfcfcf;
+        }
+        .label {
+            color: #ff8080;
+            font-weight: 600;
+        }
+        .count {
+            color: #ff6666;
+            margin-bottom: 4px;
+            font-size: 14px;
+        }
+        .country-tag {
+            background: #300000;
+            border: 1px solid #ff4d4d;
+            border-radius: 4px;
+            padding: 2px 6px;
+            font-size: 11px;
+            display: inline-block;
+            margin-left: 6px;
         }
     </style>
-
 
     <script>
         async function loadMIL() {
@@ -1392,18 +1437,18 @@ HTML_MIL = """
 
             const res = await fetch('/api/mil');
             if (!res.ok) {
-                con.innerHTML = "<div>Error loading military data</div>";
+                con.innerHTML = "<div style='color:#ff4d4d;'>Error loading military data</div>";
                 return;
             }
 
             const aircraft = await res.json();
 
             if (!aircraft.length) {
-                con.innerHTML = "<div>No military aircraft detected.</div>";
+                con.innerHTML = "<div style='color:#ff4d4d;'>No military aircraft detected.</div>";
                 return;
             }
 
-            con.innerHTML = "<div style='margin-bottom:8px; color:#8ab;'>Detected: <b>" +
+            con.innerHTML = "<div class='count'>Detected: <b>" +
                 aircraft.length +
                 "</b> military aircraft</div>";
 
@@ -1412,11 +1457,16 @@ HTML_MIL = """
                 el.className = "mil-card";
                 el.innerHTML = `
                     <div class="callsign">${ac.flight || "UNKNOWN"}</div>
-                    <div class="row"><b>HEX:</b> ${ac.hex}</div>
-                    <div class="row"><b>Type:</b> ${ac.t || ac.type || "N/A"}</div>
-                    <div class="row"><b>Altitude:</b> ${ac.alt_baro || "??"} ft</div>
-                    <div class="row"><b>Category:</b> ${ac.category || "??"}</div>
-                    <div class="row"><b>Messages:</b> ${ac.messages || "??"}</div>
+                    <div class="row"><span class="label">HEX:</span> ${ac.hex}</div>
+                    <div class="row"><span class="label">Type:</span> ${ac.db_type || ac.t || "N/A"}</div>
+                    <div class="row"><span class="label">ICAO:</span> ${ac.db_icao || "N/A"}</div>
+                    <div class="row"><span class="label">Manufacturer:</span> ${ac.db_manufacturer || "N/A"}</div>
+                    <div class="row"><span class="label">Owner:</span> ${ac.db_owner || "N/A"}</div>
+                    <div class="row"><span class="label">Country:</span>
+                        ${ac.db_country || "N/A"}
+                        ${ac.category ? `<span class='country-tag'>${ac.category}</span>` : ""}
+                    </div>
+                    <div class="row"><span class="label">Altitude:</span> ${ac.alt_baro || "??"} ft</div>
                 `;
                 con.appendChild(el);
             });
@@ -1429,7 +1479,7 @@ HTML_MIL = """
 <body>
 
 <header>
-    <div class="title">MIL Aircraft</div>
+    <div class="title">MILITARY AIR OPS</div>
     <div class="back-link"><a href="/">← Back</a></div>
 </header>
 
@@ -1438,8 +1488,6 @@ HTML_MIL = """
 </body>
 </html>
 """
-
-
 
 @app.route("/")
 def index():
@@ -1453,8 +1501,6 @@ def stats_page():
 @app.route("/mil")
 def mil_page():
     return render_template_string(HTML_MIL)
-
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
