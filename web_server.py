@@ -16,6 +16,10 @@ from flask import (
 )
 from flight_logger import DB_PATH
 
+UA_HEADERS = {
+    "User-Agent": "FlightPi/1.0 (Raspberry Pi)"
+}
+
 app = Flask(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MIL_CACHE_PATH = os.path.join(BASE_DIR, "mil_cache.json")
@@ -377,17 +381,16 @@ def api_stats():
 # ---------------------------------------------------
 @app.route("/api/mil")
 def api_mil():
-    """
-    Calls https://api.adsb.lol/v2/mil and returns a simplified
-    list of military aircraft. No DB writes, just pass-through.
-    """
     try:
-        r = requests.get("https://api.adsb.lol/v2/mil", timeout=6)
+        r = requests.get(
+            "https://api.adsb.lol/v2/mil",
+            headers=UA_HEADERS,
+            timeout=10
+        )
         r.raise_for_status()
         data = r.json()
         ac_list = data.get("ac", []) or []
 
-        # Keep it light: only send fields we actually need
         simplified = []
         for ac in ac_list:
             simplified.append(
@@ -406,9 +409,19 @@ def api_mil():
                 }
             )
 
-        # Sort by altitude desc if available
-        simplified.sort(key=lambda a: a.get("alt_baro") or 0, reverse=True)
+        # ───────────────────────────────────────────────
+        #    SAFELY sort by altitude as numeric
+        # ───────────────────────────────────────────────
+        def safe_altitude(v):
+            try:
+                return float(v)
+            except:
+                return -1
+
+        simplified.sort(key=lambda a: safe_altitude(a.get("alt_baro")), reverse=True)
+
         return jsonify({"count": len(simplified), "aircraft": simplified})
+
     except Exception as e:
         return jsonify({"error": "mil_fetch_failed", "details": str(e)}), 502
 
