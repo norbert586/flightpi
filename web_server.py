@@ -1659,6 +1659,57 @@ HTML_MIL = """
         let milData = [];
         let lastLoadedAt = null;
 
+function computeMilStats(data) {
+    const typeCount = {};
+    const ownerCount = {};
+    const manufacturerCount = {};
+
+    data.forEach(ac => {
+        const t = ac.db_type || ac.t || null;
+        if (t) typeCount[t] = (typeCount[t] || 0) + 1;
+
+        const o = ac.db_owner || null;
+        if (o) ownerCount[o] = (ownerCount[o] || 0) + 1;
+
+        const m = ac.db_manufacturer || null;
+        if (m) manufacturerCount[m] = (manufacturerCount[m] || 0) + 1;
+    });
+
+    function topFive(obj) {
+        return Object.entries(obj)
+            .sort((a,b) => b[1]-a[1])
+            .slice(0,5)
+            .map(x => `${x[0]} — ${x[1]}`)
+            .join("<br>");
+    }
+
+    document.getElementById("milStats").innerHTML = `
+        <div style="margin-bottom:8px; font-size:14px; color:#ff7373;">
+            <strong>MIL FRAME STATISTICS</strong>
+        </div>
+
+        <div style="margin-bottom:6px;">
+            <strong>Total aircraft:</strong> ${data.length}
+        </div>
+
+        <div style="margin-top:6px; margin-bottom:6px;">
+            <strong>Top Types:</strong><br>
+            ${topFive(typeCount) || "No type data"}
+        </div>
+
+        <div style="margin-top:6px; margin-bottom:6px;">
+            <strong>Top Owners:</strong><br>
+            ${topFive(ownerCount) || "No owner data"}
+        </div>
+
+        <div style="margin-top:6px; margin-bottom:6px;">
+            <strong>Top Manufacturers:</strong><br>
+            ${topFive(manufacturerCount) || "No manufacturer data"}
+        </div>
+    `;
+}
+
+
         function countryFlagUrl(iso) {
             if (!iso) return null;
             return "https://flagcdn.com/w20/" + iso.toLowerCase() + ".png";
@@ -1746,6 +1797,8 @@ HTML_MIL = """
                 lastLoadedAt = new Date();
                 statusEl.textContent = "Snapshot loaded " + lastLoadedAt.toLocaleTimeString();
                 renderMil();
+                computeMilStats(milData);
+
             } catch (e) {
                 statusEl.textContent = "Error fetching /v2/mil.";
             }
@@ -1849,7 +1902,7 @@ HTML_MIL = """
     </div>
     <div id="loadStatus">Loading…</div>
 </div>
-
+<div id="milStats" style="margin: 14px; font-size:13px; color:#d0d3d6;"></div>
 <div class="container" id="milCards">
     <!-- Filled by JS -->
 </div>
