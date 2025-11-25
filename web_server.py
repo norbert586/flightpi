@@ -5,6 +5,7 @@ import os
 import sqlite3
 import json
 import time
+import requests
 from flask import (
     Flask,
     jsonify,
@@ -14,10 +15,10 @@ from flask import (
     Response,
 )
 from flight_logger import DB_PATH
-import requests
 
 app = Flask(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MIL_CACHE_PATH = os.path.join(BASE_DIR, "mil_cache.json")
 
 # ---------------------------------------------------
 # Favicon
@@ -28,7 +29,7 @@ def favicon():
     return send_from_directory(BASE_DIR, "favicon.png", mimetype="image/png")
 
 # ---------------------------------------------------
-# Plane image endpoint
+# Plane image endpoint (for main log modal)
 # ---------------------------------------------------
 @app.route("/planeimg/<hex_code>")
 def plane_image(hex_code):
@@ -39,12 +40,81 @@ def plane_image(hex_code):
     if os.path.exists(photo_path):
         return send_from_directory(photo_dir, f"{hex_code}.jpg")
 
-    # We return a 1x1 transparent pixel and let CSS handle
+    # Fallback: 1x1 transparent pixel or blank fallback
     return send_from_directory(BASE_DIR, "blank.png", mimetype="image/png")
 
 
 # ---------------------------------------------------
-# DB Helpers
+# MIL cache helpers (for ADSBdb lookups)
+# ---------------------------------------------------
+def load_mil_cache():
+    if not os.path.exists(MIL_CACHE_PATH):
+        return {}
+    try:
+        with open(MIL_CACHE_PATH, "r") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+        return {}
+    except Exception:
+        return {}
+
+
+def save_mil_cache(cache):
+    tmp = MIL_CACHE_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cache, f)
+    os.replace(tmp, MIL_CACHE_PATH)
+
+
+def get_mil_aircraft_details(hex_code: str):
+    """
+    Lazy, cached ADSBdb lookup.
+    Returns a small dict with enriched info about this hex.
+    """
+    hex_code = (hex_code or "").strip().upper()
+    if not hex_code:
+        return {"error": "no_hex"}
+
+    cache = load_mil_cache()
+    if hex_code in cache:
+        return cache[hex_code]
+
+    url = f"https://api.adsbdb.com/v0/aircraft/{hex_code}"
+    try:
+        r = requests.get(url, timeout=6)
+        r.raise_for_status()
+        j = r.json()
+        ac = j.get("response", {}).get("aircraft")
+        if not ac:
+            data = {
+                "hex": hex_code,
+                "found": False,
+            }
+        else:
+            data = {
+                "hex": hex_code,
+                "found": True,
+                "type": ac.get("type"),
+                "icao_type": ac.get("icao_type"),
+                "manufacturer": ac.get("manufacturer"),
+                "mode_s": ac.get("mode_s"),
+                "country_iso": ac.get("registered_owner_country_iso_name"),
+                "country_name": ac.get("registered_owner_country_name"),
+                "owner": ac.get("registered_owner"),
+            }
+        cache[hex_code] = data
+        save_mil_cache(cache)
+        return data
+    except Exception:
+        # If lookup fails and we have nothing cached, return a basic error
+        if hex_code in cache:
+            return cache[hex_code]
+        return {"hex": hex_code, "found": False, "error": "lookup_failed"}
+
+
+# ---------------------------------------------------
+# DB Helpers (main flight log)
 # ---------------------------------------------------
 def get_recent_flights(limit=150):
     conn = sqlite3.connect(DB_PATH)
@@ -279,7 +349,7 @@ def get_stats():
 
 
 # ---------------------------------------------------
-# API Endpoints
+# API Endpoints (main)
 # ---------------------------------------------------
 @app.route("/api/flights")
 def api_flights():
@@ -301,46 +371,57 @@ def api_flight_detail():
 def api_stats():
     return jsonify(get_stats())
 
+
+# ---------------------------------------------------
+# API: MIL live feed (no DB, just live endpoint)
+# ---------------------------------------------------
 @app.route("/api/mil")
 def api_mil():
+    """
+    Calls https://api.adsb.lol/v2/mil and returns a simplified
+    list of military aircraft. No DB writes, just pass-through.
+    """
     try:
-        r = requests.get("https://api.adsb.lol/v2/mil", timeout=10)
-        if r.status_code != 200:
-            return jsonify({"error": "bad_status", "status": r.status_code}), 500
-        raw = r.json().get("ac", [])
+        r = requests.get("https://api.adsb.lol/v2/mil", timeout=6)
+        r.raise_for_status()
+        data = r.json()
+        ac_list = data.get("ac", []) or []
 
-        enriched = []
-        for ac in raw:
-            hexcode = ac.get("hex", "").strip().upper()
-            info = {}
+        # Keep it light: only send fields we actually need
+        simplified = []
+        for ac in ac_list:
+            simplified.append(
+                {
+                    "hex": ac.get("hex"),
+                    "flight": (ac.get("flight") or "").strip(),
+                    "alt_baro": ac.get("alt_baro"),
+                    "squawk": ac.get("squawk"),
+                    "category": ac.get("category"),
+                    "seen": ac.get("seen"),
+                    "rssi": ac.get("rssi"),
+                    "t": ac.get("t"),
+                    "type": ac.get("type"),
+                    "lat": ac.get("lat") or ac.get("rr_lat"),
+                    "lon": ac.get("lon") or ac.get("rr_lon"),
+                }
+            )
 
-            if hexcode:
-                try:
-                    r2 = requests.get(
-                        f"https://api.adsbdb.com/v0/aircraft/{hexcode}",
-                        timeout=6
-                    )
-                    if r2.status_code == 200:
-                        j = r2.json()
-                        ad = j.get("response", {}).get("aircraft", {})
-                        info = {
-                            "db_type": ad.get("type"),
-                            "db_icao": ad.get("icao_type"),
-                            "db_manufacturer": ad.get("manufacturer"),
-                            "db_owner": ad.get("registered_owner"),
-                            "db_country": ad.get("registered_owner_country_name"),
-                        }
-                except:
-                    pass
-
-            merged = ac.copy()
-            merged.update(info)
-            enriched.append(merged)
-
-        return jsonify(enriched)
-
+        # Sort by altitude desc if available
+        simplified.sort(key=lambda a: a.get("alt_baro") or 0, reverse=True)
+        return jsonify({"count": len(simplified), "aircraft": simplified})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "mil_fetch_failed", "details": str(e)}), 502
+
+
+@app.route("/api/mil_detail")
+def api_mil_detail():
+    """
+    Lazy ADSBdb enrichment for a single hex.
+    Uses file-based cache so repeated clicks are instant.
+    """
+    hex_code = request.args.get("hex", "")
+    data = get_mil_aircraft_details(hex_code)
+    return jsonify(data)
 
 
 # ---------------------------------------------------
@@ -363,12 +444,11 @@ def sse_events():
                     rid = rowd.get("id")
                     if rid != last_id:
                         last_id = rid
-                        # send JSON payload (use default=str for datetimes)
                         yield f"data: {json.dumps(rowd, default=str)}\n\n"
             except Exception:
-                # keep loop alive on error
                 pass
             time.sleep(2)
+
     return Response(gen(), mimetype="text/event-stream")
 
 # ---------------------------------------------------
@@ -485,13 +565,12 @@ HTML_MAIN = """
             padding: 12px 14px;
             margin-bottom: 12px;
             cursor: pointer;
-            position: relative; /* allow absolute badge to position inside card without overlapping content */
+            position: relative;
         }
         .card:hover {
             border-color: #2a3540;
         }
 
-        /* Highlight for the top / most-recent card */
         .latest-record {
             border-left: 4px solid #ff6f00;
             background: linear-gradient(180deg, rgba(255,111,0,0.04), transparent);
@@ -501,11 +580,13 @@ HTML_MAIN = """
             position: relative;
             padding-left: 12px;
         }
-        /* prevent the latest badge overlapping the right-side tag by adding right spacing to the tag */
         .latest-record .tag {
             margin-right: 92px;
         }
-        .latest-record:hover { transform: translateY(-4px); box-shadow: 0 10px 24px rgba(0,0,0,0.12); }
+        .latest-record:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 10px 24px rgba(0,0,0,0.12);
+        }
 
         .latest-badge {
             position: absolute;
@@ -527,7 +608,6 @@ HTML_MAIN = """
             100% { box-shadow: 0 0 0 0 rgba(255,111,0,0); }
         }
 
-        /* micro-animation when a new latest arrives */
         .latest-animate {
             animation: topGlow 900ms ease-out;
         }
@@ -608,7 +688,22 @@ HTML_MAIN = """
             font-size: 13px;
         }
 
-        /* Modal detail */
+        .plane-img-box {
+            width: 260px;
+            height: 160px;
+            border-radius: 6px;
+            border: 1px solid #2a3138;
+            background: linear-gradient(135deg, #2e363d, #1e252b);
+            object-fit: cover;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #b8c2ca;
+            font-size: 13px;
+            font-weight: 500;
+            text-align: center;
+        }
+
         .modal-backdrop {
             position: fixed;
             inset: 0;
@@ -719,7 +814,6 @@ HTML_MAIN = """
         function applyFilterAndSort() {
             let list = flightsData.slice();
 
-            // filter
             if (currentFilter !== "all") {
                 list = list.filter(f => {
                     const tag = classifyTag(f);
@@ -727,7 +821,6 @@ HTML_MAIN = """
                 });
             }
 
-            // sort
             if (currentSort === "altitude") {
                 list.sort((a, b) => (b.altitude_ft || 0) - (a.altitude_ft || 0));
             } else if (currentSort === "distance") {
@@ -737,7 +830,6 @@ HTML_MAIN = """
                     return da - db;
                 });
             } else {
-                // latest
                 list.sort((a, b) => {
                     const da = parseSeen(a.seen_at);
                     const db = parseSeen(b.seen_at);
@@ -849,11 +941,11 @@ HTML_MAIN = """
                 if (d) {
                     const diffSec = (Date.now() - d.getTime()) / 1000;
                     if (diffSec < 90) {
-                        dot.style.background = "#19ff86";   // green
+                        dot.style.background = "#19ff86";
                     } else if (diffSec < 300) {
-                        dot.style.background = "#ffc842";   // amber
+                        dot.style.background = "#ffc842";
                     } else {
-                        dot.style.background = "#ff4b5c";   // red
+                        dot.style.background = "#ff4b5c";
                     }
                     lastUpdateEl.textContent =
                         "Last update: " +
@@ -883,9 +975,7 @@ HTML_MAIN = """
                     <div class="mini-stat-item">Top airline today: <strong>${s.top_airline_today || "—"}</strong></div>
                     <div class="mini-stat-item">Total logged: <strong>${s.total_flights}</strong></div>
                 `;
-            } catch (e) {
-                // ignore for now
-            }
+            } catch (e) {}
         }
 
         function onSortChange(sel) {
@@ -936,7 +1026,6 @@ HTML_MAIN = """
             const flagUrl = countryFlagUrl(countryIso);
 
             let imgTag = `<img src="/planeimg/${f.hex}" class="plane-img-box">`;
-
             if (!f.hex) {
                 imgTag = `<div class="plane-img-box">NO IMAGE AVAILABLE</div>`;
             }
@@ -958,7 +1047,6 @@ HTML_MAIN = """
                     ${imgTag}
                 </div>
             `;
-
         }
 
         function closeModal() {
@@ -976,53 +1064,37 @@ HTML_MAIN = """
             loadStats();
         };
 
-        /* Real-time EventSource subscription: insert new latest and trigger micro-animation */
         if (window.EventSource) {
             try {
                 const es = new EventSource('/events');
                 es.onmessage = e => {
                     try {
                         const row = JSON.parse(e.data);
-                        // Deduplicate: remove same id if already in list
                         flightsData = flightsData.filter(r => r.id !== row.id);
-                        // Insert at front
                         flightsData.unshift(row);
-                        // keep limit
                         flightsData = flightsData.slice(0, 150);
                         renderFlights();
 
-                        // trigger micro-animation on top card
                         const container = document.getElementById('cards');
-                        const top = container.querySelector('.card'); // after render, first .card is top
+                        const top = container.querySelector('.card');
                         if (top) {
-                            // add animate class
                             top.classList.remove('latest-animate');
-                            // force reflow to restart animation
                             void top.offsetWidth;
                             top.classList.add('latest-animate');
 
-                            // pulse the badge if present
                             const badge = top.querySelector('.latest-badge');
                             if (badge) {
                                 badge.classList.remove('badge-pulse');
                                 void badge.offsetWidth;
                                 badge.classList.add('badge-pulse');
-                                // remove pulse class after animation completes
                                 setTimeout(() => badge.classList.remove('badge-pulse'), 900);
                             }
-                            // remove animate class after animation completes
                             setTimeout(() => top.classList.remove('latest-animate'), 1000);
                         }
-                    } catch (err) {
-                        // ignore malformed events
-                    }
+                    } catch (err) {}
                 };
-                es.onerror = () => {
-                    // no-op; browser will retry automatically
-                };
-            } catch (err) {
-                // EventSource not available or failed to open
-            }
+                es.onerror = () => {};
+            } catch (err) {}
         }
     </script>
 
@@ -1037,7 +1109,8 @@ HTML_MAIN = """
     <div class="subheader">
         <div id="lastUpdate">Last update: —</div>
         <div class="subheader-right">
-            <a href="/stats">View stats</a>
+            <a href="/stats">View stats</a> ·
+            <a href="/mil">MIL board</a>
         </div>
     </div>
     <div class="mini-stats" id="miniStats">
@@ -1130,22 +1203,6 @@ HTML_STATS = """
             padding: 14px 14px 20px 14px;
         }
 
-        .plane-img-box {
-            width: 260px;
-            height: 160px;
-            border-radius: 6px;
-            border: 1px solid #2a3138;
-            background: linear-gradient(135deg, #2e363d, #1e252b);
-            object-fit: cover;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: #b8c2ca;
-            font-size: 13px;
-            font-weight: 500;
-            text-align: center;
-        }
-
         .section {
             background: #14181d;
             border: 1px solid #1f242a;
@@ -1211,7 +1268,6 @@ HTML_STATS = """
                 " · Flights today: " + s.flights_today +
                 " · Unique aircraft today: " + s.unique_today;
 
-            // Top airlines
             const tAirlines = document.getElementById("topAirlinesBody");
             tAirlines.innerHTML = "";
             s.top_airlines.forEach((r, idx) => {
@@ -1224,7 +1280,6 @@ HTML_STATS = """
                 tAirlines.appendChild(tr);
             });
 
-            // Top types
             const tTypes = document.getElementById("topTypesBody");
             tTypes.innerHTML = "";
             s.top_types.forEach((r, idx) => {
@@ -1237,7 +1292,6 @@ HTML_STATS = """
                 tTypes.appendChild(tr);
             });
 
-            // Top countries
             const tCountries = document.getElementById("topCountriesBody");
             tCountries.innerHTML = "";
             s.top_countries.forEach((r, idx) => {
@@ -1256,7 +1310,6 @@ HTML_STATS = """
                 tCountries.appendChild(tr);
             });
 
-            // Top aircraft
             const tAircraft = document.getElementById("topAircraftBody");
             tAircraft.innerHTML = "";
             s.top_aircraft.forEach((r, idx) => {
@@ -1352,142 +1405,456 @@ HTML_STATS = """
 """
 
 # ---------------------------------------------------
-# /mil page
+# MIL page
 # ---------------------------------------------------
 HTML_MIL = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Military Aircraft Monitor</title>
+    <title>Flight-Pi MIL Board</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <link rel="icon" href="/favicon.ico" type="image/png">
 
     <style>
         body {
-            background: #070708;
-            color: #e6e6e6;
-            font-family: "Consolas", monospace;
+            background: #050507;
+            color: #e3e3e3;
+            font-family: "Segoe UI", Roboto, Arial, sans-serif;
             margin: 0;
             padding: 0;
         }
+        a {
+            color: #ff4b6e;
+            text-decoration: none;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
         header {
-            background: #120000;
-            padding: 12px 16px;
+            background: linear-gradient(90deg, #140208, #241018);
+            padding: 12px 16px 10px 16px;
+            border-bottom: 1px solid #3a121b;
             display: flex;
             justify-content: space-between;
             align-items: center;
-            border-bottom: 2px solid #ff0000;
         }
         .title {
             font-size: 20px;
-            font-weight: 800;
-            color: #ff4d4d;
-            letter-spacing: 1px;
+            font-weight: 700;
+            letter-spacing: 1.4px;
             text-transform: uppercase;
+            color: #ff4b4b;
         }
-        .back-link a {
-            color: #ff6961;
-            text-decoration: none;
+        .subtitle {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.7px;
+            color: #ffb3b3;
         }
+        .links {
+            font-size: 13px;
+            text-align: right;
+        }
+
+        .toolbar {
+            padding: 8px 14px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #2a1015;
+            background: #0c0508;
+            font-size: 13px;
+        }
+        .toolbar-left {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        .badge-count {
+            background: #2a1015;
+            border: 1px solid #ff4b4b;
+            border-radius: 10px;
+            padding: 3px 8px;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.8px;
+        }
+        .pill {
+            background: #151018;
+            border-radius: 999px;
+            padding: 3px 8px;
+            border: 1px solid #362030;
+            font-size: 11px;
+        }
+
         .container {
-            padding: 12px;
+            padding: 10px 12px 20px 12px;
         }
+
         .mil-card {
-            background: #0e0e10;
-            border: 1px solid #2a0000;
-            padding: 12px;
+            background: #0f0b0f;
+            border: 1px solid #39151f;
             border-radius: 6px;
             margin-bottom: 10px;
-            font-size: 14px;
-            box-shadow: 0 0 8px #2d0000;
+            padding: 10px 12px;
+            cursor: pointer;
+            box-shadow: 0 6px 20px rgba(0,0,0,0.35);
         }
-        .callsign {
-            font-size: 19px;
-            font-weight: 700;
-            color: #ff4d4d;
+        .mil-card:hover {
+            border-color: #ff4b4b;
         }
-        .row {
-            font-size: 12px;
-            margin-top: 6px;
-            color: #cfcfcf;
-        }
-        .label {
-            color: #ff8080;
-            font-weight: 600;
-        }
-        .count {
-            color: #ff6666;
+
+        .mil-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
             margin-bottom: 4px;
-            font-size: 14px;
         }
-        .country-tag {
-            background: #300000;
-            border: 1px solid #ff4d4d;
-            border-radius: 4px;
-            padding: 2px 6px;
+        .mil-callsign {
+            font-size: 17px;
+            font-weight: 600;
+            color: #ffe6e6;
+        }
+        .mil-hex {
+            font-size: 12px;
+            color: #ff9b9b;
+        }
+        .mil-tag {
             font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.8px;
+            background: rgba(255,75,75,0.08);
+            border-radius: 999px;
+            padding: 2px 8px;
+            border: 1px solid rgba(255,75,75,0.4);
+            color: #ffb3b3;
+        }
+
+        .mil-row {
+            font-size: 13px;
+            margin: 2px 0;
+        }
+        .mil-label {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.6px;
+            color: #ff9b9b;
+            margin-right: 6px;
+        }
+
+        .status-dot {
             display: inline-block;
-            margin-left: 6px;
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            margin-right: 4px;
+        }
+        .status-dot-hot { background: #ff4b4b; }
+        .status-dot-cold { background: #555; }
+
+        .mil-footer {
+            margin-top: 4px;
+            font-size: 11px;
+            color: #b07b7b;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .modal-backdrop {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.7);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+        .modal-card {
+            background: #11080d;
+            border: 1px solid #ff4b4b;
+            border-radius: 8px;
+            max-width: 420px;
+            width: 90%;
+            padding: 16px 18px 14px 18px;
+            box-shadow: 0 16px 40px rgba(0,0,0,0.9);
+        }
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .modal-title {
+            font-size: 16px;
+            font-weight: 600;
+            color: #ffe6e6;
+        }
+        .modal-close {
+            cursor: pointer;
+            font-size: 18px;
+            color: #ff9b9b;
+        }
+        .modal-row {
+            margin: 4px 0;
+            font-size: 13px;
+        }
+        .modal-label {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.6px;
+            color: #ff9b9b;
+            margin-right: 6px;
+        }
+        .intel-pending {
+            font-size: 12px;
+            color: #ffb3b3;
+            margin-top: 6px;
+        }
+
+        .flag {
+            height: 14px;
+            margin-right: 4px;
+            vertical-align: middle;
+            border-radius: 2px;
+        }
+
+        .skeleton {
+            background: linear-gradient(90deg, #1a1114 0px, #24151b 40px, #1a1114 80px);
+            background-size: 200% 100%;
+            animation: shimmer 1.4s infinite;
+            border-radius: 4px;
+            height: 10px;
+            width: 100px;
+            display: inline-block;
+        }
+
+        @keyframes shimmer {
+            0% { background-position: -40px 0; }
+            100% { background-position: 40px 0; }
+        }
+
+        @media (min-width: 900px) {
+            .container {
+                max-width: 800px;
+                margin: 0 auto;
+            }
         }
     </style>
 
     <script>
-        async function loadMIL() {
-            const con = document.getElementById("milbox");
-            con.innerHTML = "<div>Loading...</div>";
+        let milData = [];
+        let lastLoadedAt = null;
 
-            const res = await fetch('/api/mil');
-            if (!res.ok) {
-                con.innerHTML = "<div style='color:#ff4d4d;'>Error loading military data</div>";
-                return;
-            }
-
-            const aircraft = await res.json();
-
-            if (!aircraft.length) {
-                con.innerHTML = "<div style='color:#ff4d4d;'>No military aircraft detected.</div>";
-                return;
-            }
-
-            con.innerHTML = "<div class='count'>Detected: <b>" +
-                aircraft.length +
-                "</b> military aircraft</div>";
-
-            aircraft.forEach(ac => {
-                const el = document.createElement("div");
-                el.className = "mil-card";
-                el.innerHTML = `
-                    <div class="callsign">${ac.flight || "UNKNOWN"}</div>
-                    <div class="row"><span class="label">HEX:</span> ${ac.hex}</div>
-                    <div class="row"><span class="label">Type:</span> ${ac.db_type || ac.t || "N/A"}</div>
-                    <div class="row"><span class="label">ICAO:</span> ${ac.db_icao || "N/A"}</div>
-                    <div class="row"><span class="label">Manufacturer:</span> ${ac.db_manufacturer || "N/A"}</div>
-                    <div class="row"><span class="label">Owner:</span> ${ac.db_owner || "N/A"}</div>
-                    <div class="row"><span class="label">Country:</span>
-                        ${ac.db_country || "N/A"}
-                        ${ac.category ? `<span class='country-tag'>${ac.category}</span>` : ""}
-                    </div>
-                    <div class="row"><span class="label">Altitude:</span> ${ac.alt_baro || "??"} ft</div>
-                `;
-                con.appendChild(el);
-            });
+        function countryFlagUrl(iso) {
+            if (!iso) return null;
+            return "https://flagcdn.com/w20/" + iso.toLowerCase() + ".png";
         }
 
-        window.onload = loadMIL;
-    </script>
+        function formatTimeAgoSeen(secs) {
+            if (secs == null) return "Unknown";
+            if (secs < 60) return secs.toFixed(1) + "s ago";
+            const m = secs / 60;
+            if (m < 60) return m.toFixed(1) + " min ago";
+            const h = m / 60;
+            return h.toFixed(1) + " hr ago";
+        }
 
+        function renderMil() {
+            const container = document.getElementById("milCards");
+            container.innerHTML = "";
+
+            milData.forEach(ac => {
+                const card = document.createElement("div");
+                card.className = "mil-card";
+                card.dataset.hex = ac.hex || "";
+
+                const cs = (ac.flight || "").trim() || "UNKNOWN";
+                const hex = ac.hex || "—";
+                const alt = ac.alt_baro != null ? ac.alt_baro + " ft" : "Unknown";
+                const squawk = ac.squawk || "—";
+                const cat = ac.category || "—";
+                const rssi = ac.rssi != null ? ac.rssi.toFixed(1) + " dB" : "Unknown";
+                const seenAgo = ac.seen != null ? formatTimeAgoSeen(ac.seen) : "Unknown";
+                const hot = ac.seen != null && ac.seen < 60;
+
+                card.innerHTML = `
+                    <div class="mil-card-header">
+                        <div>
+                            <div class="mil-callsign">${cs}</div>
+                            <div class="mil-hex">HEX ${hex}</div>
+                        </div>
+                        <div class="mil-tag">
+                            ${hot ? '<span class="status-dot status-dot-hot"></span>HOT' : '<span class="status-dot status-dot-cold"></span>STALE'}
+                        </div>
+                    </div>
+                    <div class="mil-row">
+                        <span class="mil-label">Altitude</span>${alt}
+                    </div>
+                    <div class="mil-row">
+                        <span class="mil-label">Squawk</span>${squawk}
+                    </div>
+                    <div class="mil-row">
+                        <span class="mil-label">Category</span>${cat}
+                    </div>
+                    <div class="mil-row">
+                        <span class="mil-label">Signal</span>${rssi}
+                    </div>
+                    <div class="mil-footer">
+                        <span><span class="mil-label">Seen</span>${seenAgo}</span>
+                        <span class="pill">Tap for ADSBdb intel</span>
+                    </div>
+                `;
+
+                card.addEventListener("click", () => openMilDetail(ac));
+                container.appendChild(card);
+            });
+
+            document.getElementById("countLabel").textContent =
+                milData.length + " aircraft in current /v2/mil frame";
+        }
+
+        async function loadMil() {
+            const statusEl = document.getElementById("loadStatus");
+            statusEl.textContent = "Loading current /v2/mil snapshot…";
+
+            try {
+                const res = await fetch("/api/mil");
+                const data = await res.json();
+
+                if (data.error) {
+                    statusEl.textContent = "Error fetching /v2/mil: " + data.error;
+                    milData = [];
+                    renderMil();
+                    return;
+                }
+
+                milData = data.aircraft || [];
+                lastLoadedAt = new Date();
+                statusEl.textContent = "Snapshot loaded " + lastLoadedAt.toLocaleTimeString();
+                renderMil();
+            } catch (e) {
+                statusEl.textContent = "Error fetching /v2/mil.";
+            }
+        }
+
+        function openModal() {
+            document.getElementById("milModal").style.display = "flex";
+        }
+
+        function closeModal() {
+            document.getElementById("milModal").style.display = "none";
+        }
+
+        async function openMilDetail(ac) {
+            const hex = ac.hex || "";
+            const modal = document.getElementById("milModal");
+            const body = document.getElementById("milModalBody");
+
+            modal.style.display = "flex";
+
+            const cs = (ac.flight || "").trim() || "UNKNOWN";
+            const alt = ac.alt_baro != null ? ac.alt_baro + " ft" : "Unknown";
+            const squawk = ac.squawk || "—";
+            const cat = ac.category || "—";
+            const rssi = ac.rssi != null ? ac.rssi.toFixed(1) + " dB" : "Unknown";
+            const seenAgo = ac.seen != null ? formatTimeAgoSeen(ac.seen) : "Unknown";
+
+            body.innerHTML = `
+                <div class="modal-row"><span class="modal-label">Callsign</span>${cs}</div>
+                <div class="modal-row"><span class="modal-label">Hex</span>${hex || "—"}</div>
+                <div class="modal-row"><span class="modal-label">Altitude</span>${alt}</div>
+                <div class="modal-row"><span class="modal-label">Squawk</span>${squawk}</div>
+                <div class="modal-row"><span class="modal-label">Category</span>${cat}</div>
+                <div class="modal-row"><span class="modal-label">Signal</span>${rssi}</div>
+                <div class="modal-row"><span class="modal-label">Seen</span>${seenAgo}</div>
+                <div class="intel-pending">
+                    ADSBdb intel: <span class="skeleton"></span>
+                </div>
+            `;
+
+            if (!hex) {
+                const intelDiv = document.createElement("div");
+                intelDiv.className = "intel-pending";
+                intelDiv.textContent = "No hex provided – ADSBdb lookup skipped.";
+                body.appendChild(intelDiv);
+                return;
+            }
+
+            try {
+                const res = await fetch("/api/mil_detail?hex=" + encodeURIComponent(hex));
+                const info = await res.json();
+
+                const intelDivs = document.querySelectorAll(".intel-pending");
+                intelDivs.forEach(d => d.remove());
+
+                const countryIso = info.country_iso || null;
+                const flag = countryFlagUrl(countryIso);
+                const countryName = info.country_name || countryIso || "Unknown";
+
+                const intelHtml = `
+                    <div class="modal-row"><span class="modal-label">Type</span>${info.type || "Unknown"}</div>
+                    <div class="modal-row"><span class="modal-label">ICAO Type</span>${info.icao_type || "Unknown"}</div>
+                    <div class="modal-row"><span class="modal-label">Manufacturer</span>${info.manufacturer || "Unknown"}</div>
+                    <div class="modal-row"><span class="modal-label">Owner</span>${info.owner || "Unknown"}</div>
+                    <div class="modal-row"><span class="modal-label">Mode S</span>${info.mode_s || "Unknown"}</div>
+                    <div class="modal-row">
+                        <span class="modal-label">Country</span>
+                        ${flag ? `<img src="${flag}" class="flag">` : ""}
+                        ${countryName}
+                    </div>
+                `;
+                body.insertAdjacentHTML("beforeend", intelHtml);
+            } catch (e) {
+                const intelDivs = document.querySelectorAll(".intel-pending");
+                intelDivs.forEach(d => d.textContent = "ADSBdb lookup failed.");
+            }
+        }
+
+        window.onload = () => {
+            loadMil();
+            setInterval(loadMil, 30000);
+        };
+    </script>
 </head>
 <body>
 
 <header>
-    <div class="title">MILITARY AIR OPS</div>
-    <div class="back-link"><a href="/">← Back</a></div>
+    <div>
+        <div class="title">MIL INTEL BOARD</div>
+        <div class="subtitle">Live /v2/mil snapshot · flightpi</div>
+    </div>
+    <div class="links">
+        <div><a href="/">← Live log</a> · <a href="/stats">Stats</a></div>
+    </div>
 </header>
 
-<div class="container" id="milbox"></div>
+<div class="toolbar">
+    <div class="toolbar-left">
+        <div class="badge-count" id="countLabel">0 aircraft</div>
+        <div class="pill">Source: adsb.lol /v2/mil</div>
+    </div>
+    <div id="loadStatus">Loading…</div>
+</div>
+
+<div class="container" id="milCards">
+    <!-- Filled by JS -->
+</div>
+
+<div class="modal-backdrop" id="milModal" onclick="closeModal()">
+    <div class="modal-card" onclick="event.stopPropagation()">
+        <div class="modal-header">
+            <div class="modal-title">MIL Aircraft Detail</div>
+            <div class="modal-close" onclick="closeModal()">×</div>
+        </div>
+        <div id="milModalBody" style="margin-top: 8px;"></div>
+    </div>
+</div>
 
 </body>
 </html>
 """
+
 
 @app.route("/")
 def index():
@@ -1498,9 +1865,11 @@ def index():
 def stats_page():
     return render_template_string(HTML_STATS)
 
+
 @app.route("/mil")
 def mil_page():
     return render_template_string(HTML_MIL)
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
