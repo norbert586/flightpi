@@ -46,8 +46,8 @@ class RaspberryPi:
 
         self.RST_PIN= self.gpio_mode(rst,self.OUTPUT)
         self.DC_PIN = self.gpio_mode(dc,self.OUTPUT)
-        self.BL_PIN = self.gpio_pwm(bl)
-        self.bl_DutyCycle(0)
+        self.BL_PIN = self.gpio_mode(bl, self.OUTPUT)
+        self.digital_write(self.BL_PIN, 1)
         
         #Initialize SPI
         self.SPI = spi
