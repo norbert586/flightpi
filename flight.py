@@ -99,18 +99,50 @@ def write_json(path: str, obj):
     os.replace(tmp, path)
 
 def download_image(url: str, path: str, timeout: int = 6) -> bool:
+    """Download image from URL with robust error handling."""
+    if not url or not isinstance(url, str):
+        return False
     try:
         r = requests.get(url, timeout=timeout, stream=True)
         r.raise_for_status()
         tmp = path + ".part"
+        # Clean up any existing partial download
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
         with open(tmp, "wb") as f:
             for chunk in r.iter_content(16384):
                 if chunk:
                     f.write(chunk)
+        # Verify file has some content
+        if os.path.getsize(tmp) < 100:  # Less than 100 bytes is likely corrupt
+            os.remove(tmp)
+            return False
         os.replace(tmp, path)
         return True
     except Exception:
+        # Clean up partial file on error
+        tmp = path + ".part"
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
         return False
+
+def truncate_text(d, text, font, max_w):
+    """Truncate text to fit max_w with ellipsis if needed."""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    if d.textlength(text, font=font) <= max_w:
+        return text
+    # Binary search for optimal length
+    while text and d.textlength(text + "…", font=font) > max_w:
+        text = text[:-1]
+    return (text + "…") if text else "…"
 
 def wrap_lines(d, text, font, max_w, max_lines):
     words = (text or "").split()
@@ -135,6 +167,10 @@ def wrap_lines(d, text, font, max_w, max_lines):
     return lines
 
 def autofit_text(d, text, max_w, base_size, min_size=16):
+    """Find largest font size that fits text within max_w."""
+    text = (text or "").strip()
+    if not text:
+        return F_LG
     size = base_size
     while size >= min_size:
         try:
@@ -148,15 +184,19 @@ def autofit_text(d, text, max_w, base_size, min_size=16):
 
 # ===== network =====
 def fetch_nearest(lat, lon, radius_nm):
-    url = f"https://api.adsb.lol/v2/closest/{lat}/{lon}/{radius_nm}"
-    r = requests.get(url, timeout=TIMEOUT_S)
-    r.raise_for_status()
-    data = r.json()
-    if isinstance(data, dict) and "ac" in data and data["ac"]:
-        return data["ac"][0]
-    if isinstance(data, dict) and data.get("lat") is not None:
-        return data
-    return None
+    """Fetch nearest aircraft with robust error handling."""
+    try:
+        url = f"https://api.adsb.lol/v2/closest/{lat}/{lon}/{radius_nm}"
+        r = requests.get(url, timeout=TIMEOUT_S)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, dict) and "ac" in data and data["ac"]:
+            return data["ac"][0]
+        if isinstance(data, dict) and data.get("lat") is not None:
+            return data
+        return None
+    except Exception:
+        return None
 
 def fetch_adsbdb_aircraft(reg: str):
     reg = (reg or "").strip().upper()
@@ -188,6 +228,43 @@ def fetch_adsbdb_callsign(call: str):
     except Exception:
         return read_json(p) if os.path.exists(p) else None
 
+def fetch_planespotters_photo_by_reg(reg: str):
+    """Fetch photo from planespotters.net API using registration."""
+    reg = (reg or "").strip().upper()
+    if not reg:
+        return None
+    img_path = os.path.join(CACHE_PHOTOS, f"ps_{reg}.jpg")
+    none_flag = os.path.join(CACHE_PHOTOS, f"ps_{reg}.none")
+    if os.path.exists(img_path):
+        return img_path
+    if file_is_fresh(none_flag, timedelta(hours=TTL_NO_PHOTO_HOURS)):
+        return None
+    url = f"https://api.planespotters.net/pub/photos/reg/{reg}"
+    try:
+        r = requests.get(url, timeout=TIMEOUT_S)
+        r.raise_for_status()
+        obj = r.json()
+        # API returns {"photos": [{"thumbnail": {...}, "thumbnail_large": {...}, ...}]}
+        if obj and isinstance(obj, dict) and "photos" in obj and obj["photos"]:
+            photo = obj["photos"][0]
+            # Prefer thumbnail_large, fallback to thumbnail or other fields
+            img_url = None
+            for key in ("thumbnail_large", "thumbnail", "link"):
+                if isinstance(photo.get(key), dict):
+                    img_url = photo[key].get("src")
+                    if img_url:
+                        break
+                elif isinstance(photo.get(key), str):
+                    img_url = photo[key]
+                    break
+            if img_url and download_image(img_url, img_path, timeout=8):
+                return img_path
+        open(none_flag, "w").close()
+        return None
+    except Exception:
+        open(none_flag, "w").close()
+        return None
+
 def fetch_airportdata_thumb_by_hex(hex_str: str):
     hex_str = (hex_str or "").strip().upper()
     if not hex_str:
@@ -213,14 +290,27 @@ def fetch_airportdata_thumb_by_hex(hex_str: str):
         open(none_flag, "w").close()
         return None
 
+def fetch_aircraft_photo(hex_str: str, reg: str):
+    """Try multiple sources to fetch aircraft photo. Returns path or None."""
+    # Try airport-data.com first (by hex)
+    if hex_str:
+        photo = fetch_airportdata_thumb_by_hex(hex_str)
+        if photo:
+            return photo
+    # Try planespotters.net second (by registration)
+    if reg:
+        photo = fetch_planespotters_photo_by_reg(reg)
+        if photo:
+            return photo
+    return None
+
 # ===== drawing =====
 def draw_header(d, card, callsign, type_code):
     hdr = [card[0], card[1], card[2], card[1] + HEADER_H]
     d.rectangle(hdr, fill=COL_HDR)
-    # big callsign
-    d.text((card[0] + 8, card[1] + 9), callsign, font=F_XL, fill=COL_TEXT)
-    # type pill
-    pill_txt = (type_code or "—").upper()
+
+    # Type pill (right side)
+    pill_txt = truncate_text(d, (type_code or "—").upper(), F_SM, 50)
     tw = textlen(d, pill_txt, F_SM)
     th = tb(d, pill_txt, F_SM)[1]
     pad = 6
@@ -232,12 +322,24 @@ def draw_header(d, card, callsign, type_code):
     ]
     d.rounded_rectangle(pill, radius=9, fill=COL_ACCENT)
     d.text((pill[0] + pad, pill[1] + 3), pill_txt, font=F_SM, fill=(0, 0, 0))
+
+    # Callsign (left side) - truncate to avoid overlapping pill
+    max_callsign_w = pill[0] - card[0] - 16
+    callsign_txt = truncate_text(d, callsign, F_XL, max_callsign_w)
+    d.text((card[0] + 8, card[1] + 9), callsign_txt, font=F_XL, fill=COL_TEXT)
+
     return hdr
 
 def draw_route(d, card, y, o_iata, d_iata, o_name, d_name):
     left_x = card[0] + 10
     right_x = card[2] - 10
     mid_x = (left_x + right_x) // 2
+
+    # Sanitize inputs
+    o_iata = (o_iata or "").strip().upper()
+    d_iata = (d_iata or "").strip().upper()
+    o_name = (o_name or "").strip()
+    d_name = (d_name or "").strip()
 
     max_w_side = (right_x - left_x - 44) // 2
     f_left = autofit_text(d, o_iata, max_w_side, base_size=30, min_size=18)
@@ -290,21 +392,29 @@ def draw_route(d, card, y, o_iata, d_iata, o_name, d_name):
     return max(ly, ry) + 4
 
 def draw_facts_block(d, x, y, w, facts):
-    """Right-hand fact block under the photo."""
+    """Right-hand fact block under the photo with proper truncation."""
     label_w = int(w * 0.44)
-    value_w = w - label_w
+    value_w = w - label_w - 6  # Account for gap between label and value
     for label, value in facts:
-        val = value.strip() if value else "—"
-        l_lines = wrap_lines(d, label + ":", F_TI, label_w, max_lines=2)
+        val = (value or "").strip() or "—"
+        # Truncate label if too long
+        label_txt = truncate_text(d, label + ":", F_TI, label_w)
+        # For values, use wrap_lines for multi-line support with ellipsis
         v_lines = wrap_lines(d, val, F_SM, value_w, max_lines=2)
-        lines = max(len(l_lines), len(v_lines))
-        for i in range(lines):
-            l_txt = l_lines[i] if i < len(l_lines) else ""
-            v_txt = v_lines[i] if i < len(v_lines) else ""
-            d.text((x, y), l_txt, font=F_TI, fill=COL_MUTED)
-            d.text((x + label_w + 6, y - 1), v_txt, font=F_SM, fill=COL_TEXT)
-            y += 12
-        y += FACTS_GAP_Y
+
+        # Draw label on first line
+        d.text((x, y), label_txt, font=F_TI, fill=COL_MUTED)
+
+        # Draw value line(s)
+        for i, v_line in enumerate(v_lines):
+            if i == 0:
+                # First line next to label
+                d.text((x + label_w + 6, y - 1), v_line, font=F_SM, fill=COL_TEXT)
+            else:
+                # Subsequent lines indented
+                d.text((x + label_w + 6, y + i * 12 - 1), v_line, font=F_SM, fill=COL_TEXT)
+
+        y += max(1, len(v_lines)) * 12 + FACTS_GAP_Y
     return y
 
 def draw_card(disp, callsign, type_code, model, manufacturer, country, owner, route, photo_path, reg):
@@ -313,6 +423,15 @@ def draw_card(disp, callsign, type_code, model, manufacturer, country, owner, ro
     d = ImageDraw.Draw(img)
     card = [SIDE, SIDE, W - SIDE, H - SIDE]
     d.rectangle(card, fill=COL_CARD)
+
+    # Sanitize inputs - ensure all strings are safe
+    callsign = (callsign or "Unknown").strip() or "Unknown"
+    type_code = (type_code or "—").strip() or "—"
+    model = (model or "").strip()
+    manufacturer = (manufacturer or "").strip()
+    country = (country or "").strip()
+    owner = (owner or "").strip()
+    reg = (reg or "—").strip() or "—"
 
     # Header (flight + pill)
     hdr = draw_header(d, card, callsign, type_code)
@@ -324,10 +443,10 @@ def draw_card(disp, callsign, type_code, model, manufacturer, country, owner, ro
         fr   = route["response"]["flightroute"]
         orig = fr.get("origin") or {}
         dest = fr.get("destination") or {}
-        o_iata = (orig.get("iata_code") or "").upper()
-        d_iata = (dest.get("iata_code") or "").upper()
-        o_name = orig.get("name") or orig.get("municipality") or ""
-        d_name = dest.get("name") or dest.get("municipality") or ""
+        o_iata = (orig.get("iata_code") or "").strip().upper()
+        d_iata = (dest.get("iata_code") or "").strip().upper()
+        o_name = (orig.get("name") or orig.get("municipality") or "").strip()
+        d_name = (dest.get("name") or dest.get("municipality") or "").strip()
     if o_iata and d_iata:
         y = draw_route(d, card, y, o_iata, d_iata, o_name, d_name)
     else:
@@ -368,18 +487,20 @@ def draw_card(disp, callsign, type_code, model, manufacturer, country, owner, ro
 
     # Facts on the right
     facts = [
-        ("Type",           (model or "").strip() or type_code or ""),
-        ("Manufacturer",   (manufacturer or "").strip()),
-        ("Country Registered", (country or "").strip()),
-        ("Registered owner",   (owner or "").strip()),
+        ("Type",               model or type_code),
+        ("Manufacturer",       manufacturer),
+        ("Country Registered", country),
+        ("Registered owner",   owner),
     ]
     _ = draw_facts_block(d, facts_x, y, facts_w, facts)
 
-    # Footer
-    foot = f"Reg {reg or '—'}    Updated {now_str()}"
-    fx = card[0] + (card[2]-card[0]-textlen(d, foot, F_SM))//2
+    # Footer with truncation if needed
+    foot = f"Reg {reg}    Updated {now_str()}"
+    footer_max_w = card[2] - card[0] - 16
+    foot_txt = truncate_text(d, foot, F_SM, footer_max_w)
+    fx = card[0] + (card[2]-card[0]-textlen(d, foot_txt, F_SM))//2
     fy = card[3] - FOOTER_H
-    d.text((fx, fy), foot, font=F_SM, fill=COL_MUTED)
+    d.text((fx, fy), foot_txt, font=F_SM, fill=COL_MUTED)
 
     img = img.rotate(ROTATE_DEG)
     disp.ShowImage(img)
@@ -450,7 +571,8 @@ def main():
             if key != last_key:
                 cached_aircraft   = fetch_adsbdb_aircraft(reg) if reg else None
                 cached_route      = fetch_adsbdb_callsign(callsign) if callsign else None
-                cached_photo_path = fetch_airportdata_thumb_by_hex(hex_str) if hex_str else None
+                # Try both photo APIs (airport-data.com by hex, planespotters.net by reg)
+                cached_photo_path = fetch_aircraft_photo(hex_str, reg)
                 last_key = key
 
             model = manuf = country = owner = country_iso = ""
