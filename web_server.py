@@ -5,6 +5,9 @@ import os
 import sqlite3
 import json
 import time
+import subprocess
+import shutil
+import threading
 import requests
 from flask import (
     Flask,
@@ -353,6 +356,137 @@ def get_stats():
 
 
 # ---------------------------------------------------
+# Pi system stats helper
+# ---------------------------------------------------
+def _cpu_percent():
+    """Read /proc/stat twice (100ms apart) to get real CPU usage."""
+    try:
+        def read_stat():
+            with open("/proc/stat") as f:
+                parts = f.readline().split()
+            idle = int(parts[4])
+            total = sum(int(x) for x in parts[1:8])
+            return idle, total
+        idle1, total1 = read_stat()
+        time.sleep(0.1)
+        idle2, total2 = read_stat()
+        delta_total = total2 - total1
+        if delta_total == 0:
+            return 0.0
+        return round((1 - (idle2 - idle1) / delta_total) * 100, 1)
+    except Exception:
+        return None
+
+
+def get_pi_stats():
+    stats = {}
+
+    # CPU usage
+    stats["cpu_percent"] = _cpu_percent()
+
+    # CPU temperature (Raspberry Pi thermal zone)
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp") as f:
+            stats["cpu_temp_c"] = round(int(f.read().strip()) / 1000, 1)
+    except Exception:
+        stats["cpu_temp_c"] = None
+
+    # RAM (from /proc/meminfo)
+    try:
+        with open("/proc/meminfo") as f:
+            mem = {}
+            for line in f:
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    mem[k.strip()] = int(v.strip().split()[0])
+        total_kb = mem["MemTotal"]
+        avail_kb = mem["MemAvailable"]
+        used_kb = total_kb - avail_kb
+        stats["ram_total_mb"] = round(total_kb / 1024)
+        stats["ram_used_mb"] = round(used_kb / 1024)
+        stats["ram_percent"] = round(used_kb / total_kb * 100, 1)
+    except Exception:
+        stats["ram_total_mb"] = stats["ram_used_mb"] = stats["ram_percent"] = None
+
+    # Disk usage
+    try:
+        total, used, _ = shutil.disk_usage("/")
+        stats["disk_total_gb"] = round(total / 1e9, 1)
+        stats["disk_used_gb"] = round(used / 1e9, 1)
+        stats["disk_percent"] = round(used / total * 100, 1)
+    except Exception:
+        stats["disk_total_gb"] = stats["disk_used_gb"] = stats["disk_percent"] = None
+
+    # Uptime (from /proc/uptime)
+    try:
+        with open("/proc/uptime") as f:
+            uptime_s = float(f.read().split()[0])
+        days = int(uptime_s // 86400)
+        hours = int((uptime_s % 86400) // 3600)
+        mins = int((uptime_s % 3600) // 60)
+        stats["uptime"] = f"{days}d {hours}h {mins}m" if days else f"{hours}h {mins}m"
+    except Exception:
+        stats["uptime"] = None
+
+    # Service status
+    for svc in ["flight-display", "flight-web"]:
+        key = "service_" + svc.replace("-", "_")
+        try:
+            result = subprocess.run(
+                ["systemctl", "is-active", svc],
+                capture_output=True, text=True, timeout=4
+            )
+            stats[key] = result.stdout.strip()
+        except Exception:
+            stats[key] = "unknown"
+
+    # Last flight from DB
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT callsign, reg, hex, seen_at FROM flights ORDER BY id DESC LIMIT 1")
+        row = c.fetchone()
+        conn.close()
+        stats["last_flight"] = dict(row) if row else None
+    except Exception:
+        stats["last_flight"] = None
+
+    # Last deploy (last line of deploy.log)
+    deploy_log = os.path.join(BASE_DIR, "deploy.log")
+    try:
+        if os.path.exists(deploy_log):
+            with open(deploy_log) as f:
+                lines = [ln.strip() for ln in f.readlines() if ln.strip()]
+            stats["last_deploy"] = lines[-1] if lines else None
+        else:
+            stats["last_deploy"] = None
+    except Exception:
+        stats["last_deploy"] = None
+
+    # Git info
+    try:
+        result = subprocess.run(
+            ["git", "-C", BASE_DIR, "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=4
+        )
+        stats["git_hash"] = result.stdout.strip()
+    except Exception:
+        stats["git_hash"] = None
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", BASE_DIR, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=4
+        )
+        stats["git_branch"] = result.stdout.strip()
+    except Exception:
+        stats["git_branch"] = None
+
+    return stats
+
+
+# ---------------------------------------------------
 # API Endpoints (main)
 # ---------------------------------------------------
 @app.route("/api/flights")
@@ -463,6 +597,77 @@ def sse_events():
             time.sleep(2)
 
     return Response(gen(), mimetype="text/event-stream")
+
+
+# ---------------------------------------------------
+# Pi status API endpoints
+# ---------------------------------------------------
+@app.route("/api/pi_stats")
+def api_pi_stats():
+    return jsonify(get_pi_stats())
+
+
+@app.route("/api/deploy", methods=["POST"])
+def api_deploy():
+    """Pull latest code from GitHub and restart services."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", BASE_DIR, "pull", "origin", "main"],
+            capture_output=True, text=True, timeout=60
+        )
+        output = (result.stdout + result.stderr).strip()
+
+        # Record this deploy in deploy.log
+        git_result = subprocess.run(
+            ["git", "-C", BASE_DIR, "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=4
+        )
+        git_hash = git_result.stdout.strip()
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        deploy_log = os.path.join(BASE_DIR, "deploy.log")
+        with open(deploy_log, "a") as f:
+            f.write(f"[{timestamp}] Web deploy → {git_hash}: {output[:120]}\n")
+
+        # Restart flight-display immediately in background
+        # Restart flight-web after a 3s delay so this response can be sent first
+        def restart_services():
+            time.sleep(0.5)
+            subprocess.run(["sudo", "systemctl", "restart", "flight-display"],
+                           capture_output=True, timeout=10)
+            time.sleep(3)
+            subprocess.run(["sudo", "systemctl", "restart", "flight-web"],
+                           capture_output=True, timeout=10)
+
+        t = threading.Thread(target=restart_services, daemon=True)
+        t.start()
+
+        return jsonify({"ok": True, "output": output, "git_hash": git_hash})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+_ALLOWED_SERVICES = {"flight-display", "flight-web"}
+
+
+@app.route("/api/restart_service", methods=["POST"])
+def api_restart_service():
+    """Restart a named systemd service. flight-web restarts with a delay."""
+    data = request.get_json(silent=True) or {}
+    svc = (data.get("service") or "").strip()
+    if svc not in _ALLOWED_SERVICES:
+        return jsonify({"ok": False, "error": "unknown service"}), 400
+
+    def do_restart(service, delay=0):
+        if delay:
+            time.sleep(delay)
+        subprocess.run(["sudo", "systemctl", "restart", service],
+                       capture_output=True, timeout=10)
+
+    delay = 3 if svc == "flight-web" else 0
+    t = threading.Thread(target=do_restart, args=(svc, delay), daemon=True)
+    t.start()
+    return jsonify({"ok": True, "service": svc, "delay": delay})
+
 
 # ---------------------------------------------------
 # MAIN UI (Dashboard)
@@ -1123,7 +1328,8 @@ HTML_MAIN = """
         <div id="lastUpdate">Last update: —</div>
         <div class="subheader-right">
             <a href="/stats">View stats</a> ·
-            <a href="/mil">MIL board</a>
+            <a href="/mil">MIL board</a> ·
+            <a href="/pi">Pi status</a>
         </div>
     </div>
     <div class="mini-stats" id="miniStats">
@@ -1355,7 +1561,11 @@ HTML_STATS = """
 
 <header>
     <div class="title">Flight-Pi Stats</div>
-    <div class="back-link"><a href="/">← Back to live log</a></div>
+    <div class="back-link">
+        <a href="/">← Live log</a> ·
+        <a href="/mil">MIL board</a> ·
+        <a href="/pi">Pi status</a>
+    </div>
 </header>
 
 <div class="container">
@@ -1891,7 +2101,7 @@ function computeMilStats(data) {
         <div class="subtitle">Live /v2/mil snapshot · flightpi</div>
     </div>
     <div class="links">
-        <div><a href="/">← Live log</a> · <a href="/stats">Stats</a></div>
+        <div><a href="/">← Live log</a> · <a href="/stats">Stats</a> · <a href="/pi">Pi status</a></div>
     </div>
 </header>
 
@@ -1922,6 +2132,388 @@ function computeMilStats(data) {
 """
 
 
+# ---------------------------------------------------
+# Pi status page
+# ---------------------------------------------------
+HTML_PI = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Flight-Pi Status</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="icon" href="/favicon.ico" type="image/png">
+    <style>
+        body {
+            background: #0b0e11;
+            color: #d0d3d6;
+            font-family: "Segoe UI", Roboto, Arial, sans-serif;
+            margin: 0; padding: 0;
+        }
+        a { color: #42f5d7; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        header {
+            background: #101417;
+            padding: 12px 16px 10px 16px;
+            border-bottom: 1px solid #1c2329;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .title {
+            font-size: 20px; font-weight: 600;
+            letter-spacing: 1px; text-transform: uppercase;
+        }
+        .nav-links { font-size: 13px; color: #9da8b2; }
+        .container { max-width: 900px; margin: 24px auto; padding: 0 16px; }
+        .section {
+            background: #101417;
+            border: 1px solid #1c2329;
+            border-radius: 8px;
+            padding: 18px 20px;
+            margin-bottom: 18px;
+        }
+        .section-title {
+            font-size: 11px; font-weight: 600; color: #9da8b2;
+            text-transform: uppercase; letter-spacing: 0.8px;
+            margin-bottom: 16px;
+        }
+        .grid4 {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 14px;
+        }
+        .grid2 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 14px;
+        }
+        .stat-card {
+            background: #161b20;
+            border: 1px solid #1c2329;
+            border-radius: 6px;
+            padding: 14px 16px;
+        }
+        .stat-label {
+            font-size: 11px; color: #9da8b2;
+            text-transform: uppercase; letter-spacing: 0.5px;
+            margin-bottom: 6px;
+        }
+        .stat-value { font-size: 26px; font-weight: 700; color: #42f5d7; }
+        .stat-sub { font-size: 11px; color: #9da8b2; margin-top: 2px; }
+        .bar-wrap { background: #1c2329; border-radius: 4px; height: 5px; margin-top: 10px; }
+        .bar-fill { height: 5px; border-radius: 4px; background: #42f5d7; transition: width 0.5s; }
+        .bar-fill.warn  { background: #f5a742; }
+        .bar-fill.crit  { background: #f54242; }
+        .svc-row { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+        .svc-dot {
+            width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
+        }
+        .svc-dot.active   { background: #19ff86; box-shadow: 0 0 6px #19ff86; }
+        .svc-dot.inactive { background: #f54242; }
+        .svc-dot.unknown  { background: #9da8b2; }
+        .svc-name   { font-size: 14px; font-weight: 500; }
+        .svc-status { font-size: 12px; color: #9da8b2; }
+        .kv-row { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
+        .kv-label { font-size: 12px; color: #9da8b2; min-width: 120px; }
+        .kv-value { font-size: 13px; color: #d0d3d6; }
+        .pill {
+            display: inline-block;
+            background: #1c2329; border: 1px solid #2a3340;
+            border-radius: 12px; padding: 3px 10px;
+            font-size: 12px; color: #9da8b2;
+            margin-right: 6px; margin-bottom: 4px;
+        }
+        .pill.teal { background: #0a2e2a; border-color: #42f5d7; color: #42f5d7; }
+        .btn {
+            display: inline-block; padding: 9px 18px;
+            border-radius: 6px; border: none;
+            font-size: 13px; font-weight: 600;
+            cursor: pointer; margin-right: 10px; margin-bottom: 6px;
+            transition: opacity 0.2s;
+        }
+        .btn:hover   { opacity: 0.82; }
+        .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+        .btn-teal    { background: #42f5d7; color: #0b0e11; }
+        .btn-outline { background: transparent; border: 1px solid #42f5d7; color: #42f5d7; }
+        .btn-danger  { background: transparent; border: 1px solid #f54242; color: #f54242; }
+        .output-box {
+            background: #060809; border: 1px solid #1c2329; border-radius: 6px;
+            padding: 12px 14px; font-family: monospace; font-size: 12px;
+            color: #9da8b2; white-space: pre-wrap; margin-top: 14px; display: none;
+        }
+        .last-updated { font-size: 11px; color: #9da8b2; margin-top: 12px; }
+        code { background: #161b20; border-radius: 3px; padding: 1px 5px; font-size: 12px; }
+        p.note { font-size: 13px; color: #9da8b2; margin: 0 0 14px 0; line-height: 1.5; }
+        @media (max-width: 640px) {
+            .grid4 { grid-template-columns: 1fr 1fr; }
+            .grid2 { grid-template-columns: 1fr; }
+        }
+    </style>
+
+    <script>
+        function pct(v) {
+            return (v !== null && v !== undefined) ? v + '%' : '—';
+        }
+        function barClass(p) {
+            if (p >= 85) return 'crit';
+            if (p >= 65) return 'warn';
+            return '';
+        }
+        function setBar(id, percent) {
+            const el = document.getElementById(id);
+            el.style.width = (percent || 0) + '%';
+            el.className = 'bar-fill ' + barClass(percent || 0);
+        }
+
+        function renderStats(s) {
+            // CPU
+            document.getElementById('cpuVal').textContent = pct(s.cpu_percent);
+            setBar('cpuBar', s.cpu_percent);
+
+            // Temp
+            const t = s.cpu_temp_c;
+            document.getElementById('tempVal').textContent = t !== null && t !== undefined ? t + '°C' : '—';
+            const tempPct = t ? Math.min(100, t / 85 * 100).toFixed(0) : 0;
+            const tempEl = document.getElementById('tempBar');
+            tempEl.style.width = tempPct + '%';
+            tempEl.className = 'bar-fill ' + (t >= 75 ? 'crit' : t >= 60 ? 'warn' : '');
+
+            // RAM
+            document.getElementById('ramVal').textContent = s.ram_used_mb !== null ? s.ram_used_mb + ' MB' : '—';
+            document.getElementById('ramSub').textContent = s.ram_total_mb ? 'of ' + s.ram_total_mb + ' MB' : '';
+            setBar('ramBar', s.ram_percent);
+
+            // Disk
+            document.getElementById('diskVal').textContent = s.disk_used_gb !== null ? s.disk_used_gb + ' GB' : '—';
+            document.getElementById('diskSub').textContent = s.disk_total_gb ? 'of ' + s.disk_total_gb + ' GB' : '';
+            setBar('diskBar', s.disk_percent);
+
+            // Uptime
+            document.getElementById('uptimeVal').textContent = s.uptime || '—';
+
+            // Services
+            [['flight_display', 'flight-display'], ['flight_web', 'flight-web']].forEach(([key, svc]) => {
+                const status = s['service_' + key] || 'unknown';
+                document.getElementById('dot_' + key).className = 'svc-dot ' + (status === 'active' ? 'active' : status === 'inactive' ? 'inactive' : 'unknown');
+                document.getElementById('status_' + key).textContent = status;
+            });
+
+            // Git
+            document.getElementById('gitHash').textContent   = s.git_hash   || '—';
+            document.getElementById('gitBranch').textContent = s.git_branch || '—';
+
+            // Last flight
+            const lf = s.last_flight;
+            document.getElementById('lastFlight').textContent = lf
+                ? (lf.callsign || lf.reg || lf.hex || 'Unknown') + '  ·  ' + (lf.seen_at || '')
+                : 'No flights logged yet';
+
+            // Last deploy
+            document.getElementById('lastDeploy').textContent =
+                s.last_deploy || 'No deploy log yet — run deploy.sh first';
+
+            document.getElementById('lastUpdated').textContent =
+                'Auto-refreshed: ' + new Date().toLocaleTimeString();
+        }
+
+        function loadStats() {
+            fetch('/api/pi_stats')
+                .then(r => r.json())
+                .then(renderStats)
+                .catch(e => {
+                    document.getElementById('lastUpdated').textContent = 'Fetch error: ' + e;
+                });
+        }
+
+        function runDeploy() {
+            const btn = document.getElementById('deployBtn');
+            const out = document.getElementById('deployOutput');
+            btn.disabled = true;
+            btn.textContent = 'Pulling…';
+            out.style.display = 'block';
+            out.textContent = 'Running git pull origin main…';
+
+            fetch('/api/deploy', { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    out.textContent = data.output || data.error || '(no output)';
+                    if (data.ok) {
+                        out.textContent += '\\n\\n✓ Services restarting in background.\\nPage reloads in 6 seconds…';
+                        setTimeout(() => location.reload(), 6000);
+                    }
+                    btn.disabled = false;
+                    btn.textContent = 'Pull Latest Code';
+                })
+                .catch(e => {
+                    out.textContent = 'Request failed: ' + e;
+                    btn.disabled = false;
+                    btn.textContent = 'Pull Latest Code';
+                });
+        }
+
+        function restartService(svc, btnId) {
+            const btn = document.getElementById(btnId);
+            const isWeb = svc === 'flight-web';
+            btn.disabled = true;
+            btn.textContent = 'Restarting…';
+
+            fetch('/api/restart_service', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ service: svc })
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.ok && isWeb) {
+                    btn.textContent = 'Restarting (3s delay)…';
+                    // Page may go down briefly — reload after 5s
+                    setTimeout(() => location.reload(), 5000);
+                } else {
+                    btn.textContent = data.ok ? 'Done ✓' : 'Failed';
+                    setTimeout(() => {
+                        btn.disabled = false;
+                        btn.textContent = 'Restart ' + svc;
+                        loadStats();
+                    }, 2500);
+                }
+            })
+            .catch(e => {
+                btn.textContent = 'Error';
+                setTimeout(() => { btn.disabled = false; btn.textContent = 'Restart ' + svc; }, 2000);
+            });
+        }
+
+        window.onload = () => {
+            loadStats();
+            setInterval(loadStats, 10000);
+        };
+    </script>
+</head>
+<body>
+
+<header>
+    <div class="title">Pi Status</div>
+    <div class="nav-links">
+        <a href="/">← Live log</a> ·
+        <a href="/stats">Stats</a> ·
+        <a href="/mil">MIL board</a>
+    </div>
+</header>
+
+<div class="container">
+
+    <!-- System Health -->
+    <div class="section">
+        <div class="section-title">System Health</div>
+        <div class="grid4">
+            <div class="stat-card">
+                <div class="stat-label">CPU Usage</div>
+                <div class="stat-value" id="cpuVal">—</div>
+                <div class="bar-wrap"><div class="bar-fill" id="cpuBar" style="width:0%"></div></div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">CPU Temp</div>
+                <div class="stat-value" id="tempVal">—</div>
+                <div class="bar-wrap"><div class="bar-fill" id="tempBar" style="width:0%"></div></div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">RAM Used</div>
+                <div class="stat-value" id="ramVal">—</div>
+                <div class="stat-sub" id="ramSub"></div>
+                <div class="bar-wrap"><div class="bar-fill" id="ramBar" style="width:0%"></div></div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Disk Used</div>
+                <div class="stat-value" id="diskVal">—</div>
+                <div class="stat-sub" id="diskSub"></div>
+                <div class="bar-wrap"><div class="bar-fill" id="diskBar" style="width:0%"></div></div>
+            </div>
+        </div>
+        <div style="margin-top:14px;">
+            <span class="pill teal" id="uptimeVal">—</span>
+            <span class="pill">uptime</span>
+        </div>
+        <div class="last-updated" id="lastUpdated">Loading…</div>
+    </div>
+
+    <!-- Services -->
+    <div class="section">
+        <div class="section-title">Services</div>
+        <div class="grid2">
+            <div>
+                <div class="svc-row">
+                    <div class="svc-dot unknown" id="dot_flight_display"></div>
+                    <div>
+                        <div class="svc-name">flight-display</div>
+                        <div class="svc-status" id="status_flight_display">loading…</div>
+                    </div>
+                </div>
+                <button class="btn btn-outline" id="restartDisplayBtn"
+                        onclick="restartService('flight-display', 'restartDisplayBtn')">
+                    Restart flight-display
+                </button>
+            </div>
+            <div>
+                <div class="svc-row">
+                    <div class="svc-dot unknown" id="dot_flight_web"></div>
+                    <div>
+                        <div class="svc-name">flight-web</div>
+                        <div class="svc-status" id="status_flight_web">loading…</div>
+                    </div>
+                </div>
+                <button class="btn btn-danger" id="restartWebBtn"
+                        onclick="restartService('flight-web', 'restartWebBtn')">
+                    Restart flight-web
+                </button>
+                <div style="font-size:11px;color:#9da8b2;margin-top:4px;">
+                    Page will reload after restart
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Codebase Info -->
+    <div class="section">
+        <div class="section-title">Codebase</div>
+        <div class="kv-row">
+            <span class="kv-label">Git branch</span>
+            <span class="kv-value" id="gitBranch">—</span>
+        </div>
+        <div class="kv-row">
+            <span class="kv-label">Current commit</span>
+            <span class="kv-value" id="gitHash">—</span>
+        </div>
+        <div class="kv-row">
+            <span class="kv-label">Last deploy</span>
+            <span class="kv-value" style="font-size:12px;color:#9da8b2;" id="lastDeploy">—</span>
+        </div>
+        <div class="kv-row">
+            <span class="kv-label">Last flight logged</span>
+            <span class="kv-value" id="lastFlight">—</span>
+        </div>
+    </div>
+
+    <!-- Deploy -->
+    <div class="section">
+        <div class="section-title">Deploy</div>
+        <p class="note">
+            Clicks <code>git pull origin main</code> and restarts both services automatically.
+            The web server restarts 3 seconds after pull so this response can finish.
+            The page reloads itself after 6 seconds. If it doesn't come back, SSH in and run
+            <code>sudo systemctl restart flight-web</code>.
+        </p>
+        <button class="btn btn-teal" id="deployBtn" onclick="runDeploy()">
+            Pull Latest Code
+        </button>
+        <div class="output-box" id="deployOutput"></div>
+    </div>
+
+</div>
+</body>
+</html>
+"""
+
+
 @app.route("/")
 def index():
     return render_template_string(HTML_MAIN)
@@ -1935,6 +2527,11 @@ def stats_page():
 @app.route("/mil")
 def mil_page():
     return render_template_string(HTML_MIL)
+
+
+@app.route("/pi")
+def pi_page():
+    return render_template_string(HTML_PI)
 
 
 if __name__ == "__main__":
