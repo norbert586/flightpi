@@ -358,8 +358,11 @@ def get_stats():
 # ---------------------------------------------------
 # Pi system stats helper
 # ---------------------------------------------------
+_cpu_stat_cache = None
+
 def _cpu_percent():
-    """Read /proc/stat twice (100ms apart) to get real CPU usage."""
+    """Compute CPU usage between consecutive calls (cached across 10s poll interval)."""
+    global _cpu_stat_cache
     try:
         def read_stat():
             with open("/proc/stat") as f:
@@ -367,9 +370,16 @@ def _cpu_percent():
             idle = int(parts[4])
             total = sum(int(x) for x in parts[1:8])
             return idle, total
-        idle1, total1 = read_stat()
-        time.sleep(0.1)
+
         idle2, total2 = read_stat()
+        if _cpu_stat_cache is None:
+            # First call — seed the cache and do a short blocking sample
+            _cpu_stat_cache = (idle2, total2)
+            time.sleep(0.5)
+            idle2, total2 = read_stat()
+
+        idle1, total1 = _cpu_stat_cache
+        _cpu_stat_cache = (idle2, total2)
         delta_total = total2 - total1
         if delta_total == 0:
             return 0.0
