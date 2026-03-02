@@ -20,6 +20,7 @@ REFRESH_S = 12
 ROTATE_DEG = 180
 
 BASE = os.path.expanduser("~/flight-display")
+DISPLAY_CONTROL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "display_control.json")
 CACHE_DIR = os.path.join(BASE, "cache")
 CACHE_AIRCRAFT = os.path.join(CACHE_DIR, "aircraft")
 CACHE_CALLSIGN = os.path.join(CACHE_DIR, "callsign")
@@ -33,14 +34,10 @@ TTL_NO_PHOTO_HOURS = 12
 
 # Layout
 SIDE = 8
-HEADER_H = 42
-FOOTER_H = 20
+HEADER_H = 38
+ROUTE_H  = 36
+PHOTO_H  = 160
 GAP = 6
-
-# Left/right panel bounds
-PHOTO_MAX_W = 138
-PHOTO_MAX_H = 108
-FACTS_GAP_Y = 2
 
 # Colors tuned to roughly match the web UI
 COL_BG     = (10, 12, 16)   # page background
@@ -57,16 +54,16 @@ COL_ERROR  = (120, 20, 20)
 # Fonts (tuned for 240×320)
 def load_fonts():
     try:
-        f_xl = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 22)  # callsign
-        f_lg = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)  # IATA
-        f_md = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)  # airport names
-        f_sm = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)  # facts
-        f_ti = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 11)  # tiny / labels
+        f_xl   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 22)  # callsign
+        f_iata = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24)  # IATA codes
+        f_md   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)  # medium
+        f_sm   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)  # small
+        f_ti   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 11)  # tiny
     except Exception:
-        f_xl = f_lg = f_md = f_sm = f_ti = ImageFont.load_default()
-    return f_xl, f_lg, f_md, f_sm, f_ti
+        f_xl = f_iata = f_md = f_sm = f_ti = ImageFont.load_default()
+    return f_xl, f_iata, f_md, f_sm, f_ti
 
-F_XL, F_LG, F_MD, F_SM, F_TI = load_fonts()
+F_XL, F_IATA, F_MD, F_SM, F_TI = load_fonts()
 
 # ===== helpers =====
 def now_str():
@@ -326,181 +323,109 @@ def draw_header(d, card, callsign, type_code):
     # Callsign (left side) - truncate to avoid overlapping pill
     max_callsign_w = pill[0] - card[0] - 16
     callsign_txt = truncate_text(d, callsign, F_XL, max_callsign_w)
-    d.text((card[0] + 8, card[1] + 9), callsign_txt, font=F_XL, fill=COL_TEXT)
+    cs_y = card[1] + (HEADER_H - tb(d, callsign_txt, F_XL)[1]) // 2
+    d.text((card[0] + 8, cs_y), callsign_txt, font=F_XL, fill=COL_TEXT)
 
     return hdr
 
-def draw_route(d, card, y, o_iata, d_iata, o_name, d_name):
-    left_x = card[0] + 10
-    right_x = card[2] - 10
-    mid_x = (left_x + right_x) // 2
-
-    # Sanitize inputs
-    o_iata = (o_iata or "").strip().upper()
-    d_iata = (d_iata or "").strip().upper()
-    o_name = (o_name or "").strip()
-    d_name = (d_name or "").strip()
-
-    max_w_side = (right_x - left_x - 44) // 2
-    f_left = autofit_text(d, o_iata, max_w_side, base_size=30, min_size=18)
-    f_right = autofit_text(d, d_iata, max_w_side, base_size=30, min_size=18)
-
-    lh = tb(d, o_iata, f_left)[1]
-    rh = tb(d, d_iata, f_right)[1]
-    top = y
-
-    # IATA codes
-    d.text((left_x, top), o_iata, font=f_left, fill=(245, 220, 225))
-    rx = right_x - textlen(d, d_iata, f_right)
-    d.text((rx, top), d_iata, font=f_right, fill=(245, 220, 225))
-
-    # Flight path
-    h = max(lh, rh)
-    cy = top + h // 2 + 1
-    track_l = left_x + textlen(d, o_iata, f_left) + 8
-    track_r = right_x - textlen(d, d_iata, f_right) - 8
-    track_l = min(track_l, mid_x - 20)
-    track_r = max(track_r, mid_x + 20)
-
-    d.line([(track_l, cy), (track_r, cy)], fill=COL_TRACK, width=3)
-
-    ax = track_r
-    aw = 9
-    d.polygon([(ax, cy), (ax - aw, cy - 4), (ax - aw, cy + 4)], fill=COL_ARROW)
-    d.line([(mid_x - 16, cy), (ax - aw - 2, cy)], fill=COL_ARROW, width=3)
-
-    plane = "✈"
-    pf = F_MD
-    px = mid_x - textlen(d, plane, pf) // 2
-    py = cy - tb(d, plane, pf)[1] // 2 - 1
-    d.text((px, py), plane, font=pf, fill=COL_TEXT)
-
-    y = top + h + 2
-
-    # Wrapped airport names
-    half_w = max_w_side
-    left_lines = wrap_lines(d, o_name, F_MD, half_w, max_lines=2)
-    right_lines = wrap_lines(d, d_name, F_MD, half_w, max_lines=2)
-    ly = y
-    ry = y
-    for line in left_lines:
-        d.text((left_x, ly), line, font=F_MD, fill=COL_MUTED)
-        ly += 14
-    for line in right_lines:
-        d.text((right_x - textlen(d, line, F_MD), ry), line, font=F_MD, fill=COL_MUTED)
-        ry += 14
-    return max(ly, ry) + 4
-
-def draw_facts_block(d, x, y, w, facts):
-    """Right-hand fact block under the photo with proper truncation."""
-    label_w = int(w * 0.44)
-    value_w = w - label_w - 6  # Account for gap between label and value
-    for label, value in facts:
-        val = (value or "").strip() or "—"
-        # Truncate label if too long
-        label_txt = truncate_text(d, label + ":", F_TI, label_w)
-        # For values, use wrap_lines for multi-line support with ellipsis
-        v_lines = wrap_lines(d, val, F_SM, value_w, max_lines=2)
-
-        # Draw label on first line
-        d.text((x, y), label_txt, font=F_TI, fill=COL_MUTED)
-
-        # Draw value line(s)
-        for i, v_line in enumerate(v_lines):
-            if i == 0:
-                # First line next to label
-                d.text((x + label_w + 6, y - 1), v_line, font=F_SM, fill=COL_TEXT)
-            else:
-                # Subsequent lines indented
-                d.text((x + label_w + 6, y + i * 12 - 1), v_line, font=F_SM, fill=COL_TEXT)
-
-        y += max(1, len(v_lines)) * 12 + FACTS_GAP_Y
-    return y
-
-def draw_card(disp, callsign, type_code, model, manufacturer, country, owner, route, photo_path, reg):
+def draw_card(disp, callsign, type_code, model, route, photo_path, reg, airline_name):
     W, H = disp.height, disp.width  # 240×320 portrait
     img = Image.new("RGB", (W, H), COL_BG)
     d = ImageDraw.Draw(img)
     card = [SIDE, SIDE, W - SIDE, H - SIDE]
     d.rectangle(card, fill=COL_CARD)
 
-    # Sanitize inputs - ensure all strings are safe
-    callsign = (callsign or "Unknown").strip() or "Unknown"
-    type_code = (type_code or "—").strip() or "—"
-    model = (model or "").strip()
-    manufacturer = (manufacturer or "").strip()
-    country = (country or "").strip()
-    owner = (owner or "").strip()
-    reg = (reg or "—").strip() or "—"
+    callsign     = (callsign or "Unknown").strip() or "Unknown"
+    type_code    = (type_code or "—").strip() or "—"
+    model        = (model or type_code).strip()
+    reg          = (reg or "—").strip() or "—"
+    airline_name = (airline_name or "").strip()
 
-    # Header (flight + pill)
-    hdr = draw_header(d, card, callsign, type_code)
-    y = hdr[3] + 5
+    inner_l = card[0] + 10
+    inner_r = card[2] - 10
+    inner_w = inner_r - inner_l
 
-    # Route block
-    o_iata = d_iata = o_name = d_name = ""
+    # ── Header ──────────────────────────────────────────────
+    draw_header(d, card, callsign, type_code)
+    y = card[1] + HEADER_H + GAP
+
+    # ── Route ───────────────────────────────────────────────
+    o_iata = d_iata = ""
     if route and route.get("response", {}).get("flightroute"):
         fr   = route["response"]["flightroute"]
         orig = fr.get("origin") or {}
         dest = fr.get("destination") or {}
         o_iata = (orig.get("iata_code") or "").strip().upper()
         d_iata = (dest.get("iata_code") or "").strip().upper()
-        o_name = (orig.get("name") or orig.get("municipality") or "").strip()
-        d_name = (dest.get("name") or dest.get("municipality") or "").strip()
+
+    cy = y + ROUTE_H // 2  # vertical centre of route strip
     if o_iata and d_iata:
-        y = draw_route(d, card, y, o_iata, d_iata, o_name, d_name)
+        ow = textlen(d, o_iata, F_IATA)
+        dw = textlen(d, d_iata, F_IATA)
+        ih = tb(d, o_iata, F_IATA)[1]
+        ty_iata = cy - ih // 2
+
+        d.text((inner_l, ty_iata), o_iata, font=F_IATA, fill=(245, 220, 225))
+        d.text((inner_r - dw, ty_iata), d_iata, font=F_IATA, fill=(245, 220, 225))
+
+        # Plane icon centred on the strip
+        plane = "✈"
+        mid_x = (inner_l + inner_r) // 2
+        pw = textlen(d, plane, F_MD)
+        px = mid_x - pw // 2
+        py = cy - tb(d, plane, F_MD)[1] // 2
+        d.text((px, py), plane, font=F_MD, fill=COL_TEXT)
+
+        # Track lines either side of plane
+        line_l = inner_l + ow + 5
+        line_r = inner_r - dw - 5
+        d.line([(line_l, cy), (px - 3, cy)], fill=COL_TRACK, width=2)
+        arr_start = px + pw + 3
+        d.line([(arr_start, cy), (line_r - 7, cy)], fill=COL_ARROW, width=2)
+        d.polygon([(line_r, cy), (line_r - 7, cy - 3), (line_r - 7, cy + 3)], fill=COL_ARROW)
     else:
         msg = "Route unavailable"
-        cx = card[0] + (card[2]-card[0]-textlen(d, msg, F_MD))//2
-        d.text((cx, y), msg, font=F_MD, fill=COL_MUTED)
-        y += 18
+        mx = inner_l + (inner_w - textlen(d, msg, F_SM)) // 2
+        d.text((mx, cy - tb(d, msg, F_SM)[1] // 2), msg, font=F_SM, fill=COL_MUTED)
 
-    # Two columns: photo left, facts right
-    left_x  = card[0] + 8
-    right_x = card[2] - 8
-    mid_gap = 6
-    photo_w = PHOTO_MAX_W
-    facts_x = left_x + photo_w + mid_gap
-    facts_w = right_x - facts_x
+    y += ROUTE_H + 5
 
-    # Photo
-    d.rectangle([left_x, y, left_x + photo_w, y + PHOTO_MAX_H], fill=COL_FRAME)
+    # ── Photo (full card width, dominant) ───────────────────
+    px1, py1 = inner_l, y
+    px2, py2 = inner_r, y + PHOTO_H
+    d.rectangle([px1, py1, px2, py2], fill=COL_FRAME)
     if photo_path and os.path.exists(photo_path):
         try:
             ph = Image.open(photo_path).convert("RGB")
-            scale = min(photo_w / ph.width, PHOTO_MAX_H / ph.height)
+            p_w = px2 - px1
+            scale = min(p_w / ph.width, PHOTO_H / ph.height)
             tw, th = int(ph.width * scale), int(ph.height * scale)
             ph = ph.resize((tw, th), Image.LANCZOS)
-            px = left_x + (photo_w - tw)//2
-            py = y + (PHOTO_MAX_H - th)//2
-            img.paste(ph, (px, py))
+            img.paste(ph, (px1 + (p_w - tw) // 2, py1 + (PHOTO_H - th) // 2))
         except Exception:
-            msg = "No photo"
-            tx = left_x + (photo_w - textlen(d, msg, F_SM))//2
-            ty = y + (PHOTO_MAX_H - tb(d, msg, F_SM)[1])//2
-            d.text((tx, ty), msg, font=F_SM, fill=COL_MUTED)
+            pass  # leave dark frame on error
     else:
         msg = "No photo"
-        tx = left_x + (photo_w - textlen(d, msg, F_SM))//2
-        ty = y + (PHOTO_MAX_H - tb(d, msg, F_SM)[1])//2
-        d.text((tx, ty), msg, font=F_SM, fill=COL_MUTED)
+        d.text(
+            (px1 + ((px2 - px1) - textlen(d, msg, F_SM)) // 2,
+             py1 + (PHOTO_H - tb(d, msg, F_SM)[1]) // 2),
+            msg, font=F_SM, fill=COL_MUTED,
+        )
 
-    # Facts on the right
-    facts = [
-        ("Type",               model or type_code),
-        ("Manufacturer",       manufacturer),
-        ("Country Registered", country),
-        ("Registered owner",   owner),
-    ]
-    _ = draw_facts_block(d, facts_x, y, facts_w, facts)
+    y = py2 + 7
 
-    # Footer with truncation if needed
-    foot = f"Reg {reg}    Updated {now_str()}"
-    footer_max_w = card[2] - card[0] - 16
-    foot_txt = truncate_text(d, foot, F_SM, footer_max_w)
-    fx = card[0] + (card[2]-card[0]-textlen(d, foot_txt, F_SM))//2
-    fy = card[3] - FOOTER_H
-    d.text((fx, fy), foot_txt, font=F_SM, fill=COL_MUTED)
+    # ── Info lines ───────────────────────────────────────────
+    d.text((inner_l, y), truncate_text(d, model, F_SM, inner_w), font=F_SM, fill=COL_TEXT)
+    y += 16
+
+    if airline_name:
+        d.text((inner_l, y), truncate_text(d, airline_name, F_TI, inner_w), font=F_TI, fill=COL_MUTED)
+
+    # ── Footer: reg left, time right ─────────────────────────
+    fy = card[3] - 18
+    d.text((inner_l, fy), f"Reg {reg}", font=F_TI, fill=COL_MUTED)
+    time_txt = now_str()
+    d.text((inner_r - textlen(d, time_txt, F_TI), fy), time_txt, font=F_TI, fill=COL_MUTED)
 
     img = img.rotate(ROTATE_DEG)
     disp.ShowImage(img)
@@ -535,6 +460,24 @@ def draw_error(disp, err):
     img = img.rotate(ROTATE_DEG)
     disp.ShowImage(img)
 
+# ===== display brightness control =====
+_last_brightness = 80
+
+def _apply_display_control(disp):
+    """Read display_control.json and update backlight if brightness changed."""
+    global _last_brightness
+    try:
+        if not os.path.exists(DISPLAY_CONTROL_FILE):
+            return
+        with open(DISPLAY_CONTROL_FILE) as f:
+            ctrl = json.load(f)
+        brightness = max(0, min(100, int(ctrl.get("brightness", _last_brightness))))
+        if brightness != _last_brightness:
+            disp.bl_DutyCycle(brightness)
+            _last_brightness = brightness
+    except Exception:
+        pass
+
 # ===== main =====
 def main():
     disp = LCD_2inch.LCD_2inch()
@@ -556,6 +499,7 @@ def main():
 
     while True:
         try:
+            _apply_display_control(disp)
             ac = fetch_nearest(ME_LAT, ME_LON, RADIUS_NM)
             if not ac:
                 draw_loading(disp, msg="No aircraft nearby")
@@ -633,12 +577,10 @@ def main():
                 callsign=callsign or "Unknown",
                 type_code=type_cd or "—",
                 model=model,
-                manufacturer=manuf,
-                country=country,
-                owner=owner,
                 route=cached_route,
                 photo_path=cached_photo_path,
                 reg=reg or "—",
+                airline_name=airline_name,
             )
 
         except KeyboardInterrupt:
