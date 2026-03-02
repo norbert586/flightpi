@@ -20,6 +20,7 @@ REFRESH_S = 12
 ROTATE_DEG = 180
 
 BASE = os.path.expanduser("~/flight-display")
+DISPLAY_CONTROL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "display_control.json")
 CACHE_DIR = os.path.join(BASE, "cache")
 CACHE_AIRCRAFT = os.path.join(CACHE_DIR, "aircraft")
 CACHE_CALLSIGN = os.path.join(CACHE_DIR, "callsign")
@@ -459,6 +460,24 @@ def draw_error(disp, err):
     img = img.rotate(ROTATE_DEG)
     disp.ShowImage(img)
 
+# ===== display brightness control =====
+_last_brightness = 80
+
+def _apply_display_control(disp):
+    """Read display_control.json and update backlight if brightness changed."""
+    global _last_brightness
+    try:
+        if not os.path.exists(DISPLAY_CONTROL_FILE):
+            return
+        with open(DISPLAY_CONTROL_FILE) as f:
+            ctrl = json.load(f)
+        brightness = max(0, min(100, int(ctrl.get("brightness", _last_brightness))))
+        if brightness != _last_brightness:
+            disp.bl_DutyCycle(brightness)
+            _last_brightness = brightness
+    except Exception:
+        pass
+
 # ===== main =====
 def main():
     disp = LCD_2inch.LCD_2inch()
@@ -480,6 +499,7 @@ def main():
 
     while True:
         try:
+            _apply_display_control(disp)
             ac = fetch_nearest(ME_LAT, ME_LON, RADIUS_NM)
             if not ac:
                 draw_loading(disp, msg="No aircraft nearby")

@@ -26,6 +26,7 @@ UA_HEADERS = {
 app = Flask(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MIL_CACHE_PATH = os.path.join(BASE_DIR, "mil_cache.json")
+DISPLAY_CONTROL_FILE = os.path.join(BASE_DIR, "display_control.json")
 
 # ---------------------------------------------------
 # Favicon
@@ -493,6 +494,17 @@ def get_pi_stats():
     except Exception:
         stats["git_branch"] = None
 
+    # Display brightness (from shared control file)
+    try:
+        if os.path.exists(DISPLAY_CONTROL_FILE):
+            with open(DISPLAY_CONTROL_FILE) as f:
+                ctrl = json.load(f)
+            stats["display_brightness"] = int(ctrl.get("brightness", 80))
+        else:
+            stats["display_brightness"] = 80
+    except Exception:
+        stats["display_brightness"] = None
+
     return stats
 
 
@@ -615,6 +627,22 @@ def sse_events():
 @app.route("/api/pi_stats")
 def api_pi_stats():
     return jsonify(get_pi_stats())
+
+
+@app.route("/api/display_control", methods=["POST"])
+def api_display_control():
+    data = request.get_json(silent=True) or {}
+    brightness = data.get("brightness")
+    if not isinstance(brightness, int) or not (0 <= brightness <= 100):
+        return jsonify({"ok": False, "error": "brightness must be an integer 0–100"}), 400
+    try:
+        tmp = DISPLAY_CONTROL_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"brightness": brightness}, f)
+        os.replace(tmp, DISPLAY_CONTROL_FILE)
+        return jsonify({"ok": True, "brightness": brightness})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/api/deploy", methods=["POST"])
@@ -2254,6 +2282,13 @@ HTML_PI = """
         .last-updated { font-size: 11px; color: #9da8b2; margin-top: 12px; }
         code { background: #161b20; border-radius: 3px; padding: 1px 5px; font-size: 12px; }
         p.note { font-size: 13px; color: #9da8b2; margin: 0 0 14px 0; line-height: 1.5; }
+        .brightness-btn { min-width: 72px; }
+        .brightness-btn.active {
+            background: #42f5d7;
+            color: #0b0e11;
+            border-color: #42f5d7;
+        }
+        .display-status { font-size: 11px; color: #9da8b2; margin-top: 10px; min-height: 16px; }
         @media (max-width: 640px) {
             .grid4 { grid-template-columns: 1fr 1fr; }
             .grid2 { grid-template-columns: 1fr; }
@@ -2321,6 +2356,17 @@ HTML_PI = """
             // Last deploy
             document.getElementById('lastDeploy').textContent =
                 s.last_deploy || 'No deploy log yet — run deploy.sh first';
+
+            // Display brightness
+            if (s.display_brightness !== null && s.display_brightness !== undefined) {
+                highlightBrightness(s.display_brightness);
+                const statusEl = document.getElementById('displayStatus');
+                if (!statusEl.textContent || statusEl.textContent === 'Loading…') {
+                    statusEl.textContent = s.display_brightness === 0
+                        ? 'Display off'
+                        : 'Current: ' + s.display_brightness + '%';
+                }
+            }
 
             document.getElementById('lastUpdated').textContent =
                 'Auto-refreshed: ' + new Date().toLocaleTimeString();
@@ -2390,6 +2436,32 @@ HTML_PI = """
             .catch(e => {
                 btn.textContent = 'Error';
                 setTimeout(() => { btn.disabled = false; btn.textContent = 'Restart ' + svc; }, 2000);
+            });
+        }
+
+        function setBrightness(level) {
+            const statusEl = document.getElementById('displayStatus');
+            statusEl.textContent = 'Setting…';
+            fetch('/api/display_control', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ brightness: level })
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.ok) {
+                    statusEl.textContent = level === 0 ? 'Display off' : 'Brightness set to ' + level + '%';
+                    highlightBrightness(level);
+                } else {
+                    statusEl.textContent = 'Error: ' + data.error;
+                }
+            })
+            .catch(e => { statusEl.textContent = 'Request failed: ' + e; });
+        }
+
+        function highlightBrightness(level) {
+            document.querySelectorAll('.brightness-btn').forEach(btn => {
+                btn.classList.toggle('active', parseInt(btn.dataset.level) === level);
             });
         }
 
@@ -2480,6 +2552,20 @@ HTML_PI = """
                 </div>
             </div>
         </div>
+    </div>
+
+    <!-- Display Control -->
+    <div class="section">
+        <div class="section-title">Display</div>
+        <div style="font-size: 12px; color: #9da8b2; margin-bottom: 10px;">Backlight brightness</div>
+        <div>
+            <button class="btn btn-outline brightness-btn" data-level="0"   onclick="setBrightness(0)">Off</button>
+            <button class="btn btn-outline brightness-btn" data-level="25"  onclick="setBrightness(25)">25%</button>
+            <button class="btn btn-outline brightness-btn" data-level="50"  onclick="setBrightness(50)">50%</button>
+            <button class="btn btn-outline brightness-btn" data-level="75"  onclick="setBrightness(75)">75%</button>
+            <button class="btn btn-outline brightness-btn" data-level="100" onclick="setBrightness(100)">100%</button>
+        </div>
+        <div class="display-status" id="displayStatus">Loading…</div>
     </div>
 
     <!-- Codebase Info -->
